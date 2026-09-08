@@ -1,0 +1,13 @@
+u:one
+u:two
+q:one
+q:two
+star:[one]
+star:[two]
+U:a 1
+U:b 2
+Q:a 1
+Q:b 2
+S:a 1
+S:b 2
+IFS-join: a 1 b 2

@@ -1,0 +1,7 @@
+match:65
+arr1.sh arr2.sh arr3.sh c1.sh c10.sh c11.sh c12.sh c13.sh c14.sh c15.sh c15b.sh c16.sh c17.sh c18.sh c19.sh c2.sh c20.sh c21.sh c22.sh c3.sh c4.sh c5.sh c6.sh c7.sh c8.sh c9.sh d1.sh d10.sh d11.sh d12.sh d13.sh d14.sh d15.sh d16.sh d17.sh d18.sh d19.sh d2.sh d20.sh d21.sh d22.sh d3.sh d4.sh d5.sh d6.sh d7.sh d8.sh d9.sh e1.sh e10.sh e11.sh e11b.sh e12.sh e13.sh e14.sh e15.sh e2.sh e3.sh e4.sh e5.sh e6.sh e7.sh e8.sh e9.sh exec_extra.sh
+2
+F:dt_tmp/a.txt
+F:dt_tmp/b.txt
+case:sh
+adt_tmp/a.txtb cdt_tmp/b.txtd

@@ -1,0 +1,4 @@
+x=0
+y=./e8.sc
+pos: p1 p2
+count=2

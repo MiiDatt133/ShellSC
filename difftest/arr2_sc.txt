@@ -1,0 +1,11 @@
+quoted: apple banana cherry
+unquoted: apple banana cherry
+star: apple banana cherry
+count: 3
+each:apple
+each:banana
+each:cherry
+apple
+banana
+cherry
+varidx: banana

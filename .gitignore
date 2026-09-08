@@ -1,0 +1,7 @@
+target/
+*.sc
+*.sbc
+.claude/
+.vtmp/
+
+</content>

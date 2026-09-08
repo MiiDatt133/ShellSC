@@ -1,0 +1,9 @@
+[package]
+name    = "shell_bc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = { workspace = true }
+shell_ast = { workspace = true }
+shell_ir  = { workspace = true }

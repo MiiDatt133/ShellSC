@@ -1,0 +1,2 @@
+c15b.sh: line 7: fdin_missing.txt: No such file or directory
+c15b.sh: line 8: 6: Bad file descriptor

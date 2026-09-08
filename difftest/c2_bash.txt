@@ -1,0 +1,4 @@
+hello.c: C source
+foo.txt: text
+Makefile: make
+script.sh: other

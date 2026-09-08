@@ -1,0 +1,10 @@
+sp0:[[0]]
+sp5:[five]
+len:2
+elen:0
+m: a b c d e len:5
+after: y
+w: 9 len:1
+q1:[hello world]
+q:hello world
+q:second

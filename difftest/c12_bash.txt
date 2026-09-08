@@ -1,0 +1,2 @@
+before
+cat: redir_all.txt: input file is output file

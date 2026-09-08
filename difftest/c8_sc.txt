@@ -1,0 +1,3 @@
+both
+stderr only
+no newline after

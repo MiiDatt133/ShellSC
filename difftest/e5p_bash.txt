@@ -1,0 +1,4 @@
+a=first
+b=second
+sees a=first b=second
+final a=first b=second c=third d=fourth

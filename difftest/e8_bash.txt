@@ -1,0 +1,4 @@
+x=1
+y=e8.sh
+pos: p1 p2
+count=2

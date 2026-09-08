@@ -1,0 +1,4 @@
+in=outer
+set=inner
+out=outer
+env=out1/out2

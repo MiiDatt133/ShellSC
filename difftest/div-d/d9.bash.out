@@ -1,0 +1,13 @@
+n=3
+at:[one]
+at:[two three]
+at:[four]
+star:[one two three four]
+ustar:[one]
+ustar:[two]
+ustar:[three]
+ustar:[four]
+n=2
+first:two three
+n=0
+end

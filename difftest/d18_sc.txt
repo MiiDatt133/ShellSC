@@ -1,0 +1,9 @@
+r1 r2 r3
+got:3
+r1 r2 r3
+out:extra
+r1
+r2
+r3
+[r1][r2][r3]
+r1|r2

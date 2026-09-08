@@ -1,0 +1,7 @@
+sub:mod b
+after:a b
+f:loc1 loc2
+fsub:loc1 loc2
+g:a b
+done
+trap:a b

@@ -1,0 +1,7 @@
+abc
+xyz
+empty
+singledouble
+v=1!(1)
+multi
+line

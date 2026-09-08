@@ -1,0 +1,4 @@
+sub:inner
+r=cmdsub
+out=backquote
+nested=deep

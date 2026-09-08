@@ -1,0 +1,7 @@
+GG g2
+shellsc: l1: command not found
+in:
+in2:LZ
+out:GG g2mod
+after-local:
+GG g2mod

@@ -1,0 +1,4 @@
+A-out
+A-err
+B-out
+C-err

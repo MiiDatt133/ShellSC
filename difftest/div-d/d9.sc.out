@@ -1,0 +1,16 @@
+n=3
+at:[one]
+at:[two three]
+at:[four]
+star:[one]
+star:[two three]
+star:[four]
+ustar:[one]
+ustar:[two three]
+ustar:[four]
+shellsc: shift: command not found
+n=3
+first:one
+n=0
+never:
+end

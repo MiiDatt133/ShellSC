@@ -1,0 +1,10 @@
+r1 r2 r3
+shellsc: r1: command not found
+got:0
+
+out:extra
+r1
+r2
+r3
+[r1][r2][r3]
+r1|r2

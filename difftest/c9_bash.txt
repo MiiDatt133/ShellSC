@@ -1,0 +1,6 @@
+status=10
+status=20
+direct=0
+continued
+e1=0
+e2=5

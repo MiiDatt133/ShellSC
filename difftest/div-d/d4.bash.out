@@ -1,0 +1,6 @@
+GG g2
+in:l1 l2
+in2:LZ l2
+out:GG g2mod
+after-local:
+GG g2mod

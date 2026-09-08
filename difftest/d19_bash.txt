@@ -1,0 +1,9 @@
+A:x y
+B:[xy]
+C:x,y,
+D:x
+y
+E:in x y mid
+F:x y
+G:2
+H:x y

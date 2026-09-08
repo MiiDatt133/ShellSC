@@ -1,0 +1,19 @@
+[package]
+name    = "shellsc"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "shellsc"
+path = "src/main.rs"
+
+[dependencies]
+anyhow      = { workspace = true }
+clap        = { workspace = true }
+shell_ast   = { workspace = true }
+shell_lex   = { workspace = true }
+shell_parse = { workspace = true }
+shell_ir    = { workspace = true }
+shell_bc    = { workspace = true }
+shell_vm    = { workspace = true }
+shell_pack  = { workspace = true }

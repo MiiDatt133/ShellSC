@@ -1,0 +1,8 @@
+yes
+neg=1
+neg2=0
+notted
+group-ok
+paren
+paren-ok
+both-eq

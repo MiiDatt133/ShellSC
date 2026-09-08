@@ -1,0 +1,11 @@
+script.sh
+
+local/bin/script.sh
+/usr/local/bin/script
+24
+adefb
+ab
+adefaultb
+missing=default
+local/bin/script.sh
+/usr

@@ -1,0 +1,5 @@
+hi
+hi
+more
+8
+rc=0

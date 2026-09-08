@@ -1,0 +1,6 @@
+A-Star
+X
+BAN
+AP-apple
+O-fig
+endcase

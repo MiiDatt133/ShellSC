@@ -1,0 +1,15 @@
+tar.gz
+gz
+foo.tar
+foo
+*literal*
+cdefgh
+cde
+[ spaced ]
+[spaced]
+[ spaced ]
+abcdefgh
+nonempty
+setnow
+setnow
+pre8post

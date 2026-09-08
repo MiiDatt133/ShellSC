@@ -1,0 +1,32 @@
+[workspace]
+members = [
+  "crates/shell_ast",
+  "crates/shell_lex",
+  "crates/shell_parse",
+  "crates/shell_ir",
+  "crates/shell_bc",
+  "crates/shell_vm",
+  "crates/shell_pack",
+  "crates/shell_stub",
+  "crates/shellsc",
+]
+resolver = "2"
+
+[workspace.dependencies]
+thiserror   = "1"
+anyhow      = "1"
+goblin      = { version = "0.8", default-features = false, features = ["elf64", "elf32", "endian_fd"] }
+clap        = { version = "4", features = ["derive"] }
+shell_ast   = { path = "crates/shell_ast" }
+shell_lex   = { path = "crates/shell_lex" }
+shell_parse = { path = "crates/shell_parse" }
+shell_ir    = { path = "crates/shell_ir" }
+shell_bc    = { path = "crates/shell_bc" }
+shell_vm    = { path = "crates/shell_vm" }
+shell_pack  = { path = "crates/shell_pack" }
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
