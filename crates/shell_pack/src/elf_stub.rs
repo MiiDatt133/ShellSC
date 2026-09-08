@@ -6,6 +6,8 @@ use shell_ast::ShellError;
 pub enum ElfMachine {
     Arm32,
     Aarch64,
+    X86_64,
+    X86,
     Unsupported(&'static str),
 }
 
@@ -16,7 +18,18 @@ pub fn target_machine() -> ElfMachine {
     #[cfg(target_arch = "aarch64")]
     return ElfMachine::Aarch64;
 
-    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+    #[cfg(target_arch = "x86_64")]
+    return ElfMachine::X86_64;
+
+    #[cfg(target_arch = "x86")]
+    return ElfMachine::X86;
+
+    #[cfg(not(any(
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "x86"
+    )))]
     return ElfMachine::Unsupported(std::env::consts::ARCH);
 }
 
@@ -24,6 +37,8 @@ pub fn stub_file_name() -> Option<&'static str> {
     match target_machine() {
         ElfMachine::Arm32 => Some("stub-armv7l.elf"),
         ElfMachine::Aarch64 => Some("stub-aarch64.elf"),
+        ElfMachine::X86_64 => Some("stub-x86_64.elf"),
+        ElfMachine::X86 => Some("stub-i686.elf"),
         ElfMachine::Unsupported(_) => None,
     }
 }
@@ -105,6 +120,22 @@ pub fn validate_stub(bytes: &[u8]) -> Result<(), ShellError> {
             }
             if u16::from_le_bytes([bytes[18], bytes[19]]) != 183 {
                 return Err(ShellError::IoError("stub: expected EM_AARCH64".into()));
+            }
+        }
+        ElfMachine::X86_64 => {
+            if bytes[4] != 2 {
+                return Err(ShellError::IoError("stub: expected ELF64".into()));
+            }
+            if u16::from_le_bytes([bytes[18], bytes[19]]) != 62 {
+                return Err(ShellError::IoError("stub: expected EM_X86_64".into()));
+            }
+        }
+        ElfMachine::X86 => {
+            if bytes[4] != 1 {
+                return Err(ShellError::IoError("stub: expected ELF32".into()));
+            }
+            if u16::from_le_bytes([bytes[18], bytes[19]]) != 3 {
+                return Err(ShellError::IoError("stub: expected EM_386".into()));
             }
         }
         ElfMachine::Unsupported(_) => {}

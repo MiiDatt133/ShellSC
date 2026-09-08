@@ -2,6 +2,20 @@
 
 Shell script compiler for Android and Linux. Compiles `.sh` scripts into standalone ELF executables.
 
+## Requirements
+
+- **Rust** (1.70+)
+- On Termux: `pkg install rust`
+
+## Supported Platforms
+
+- **ARMv7** (32-bit ARM — Android phones, Termux)
+- **AArch64** (64-bit ARM — Android, Raspberry Pi, ARM servers)
+- **x86_64** (PC Linux)
+- **i686** (32-bit PC Linux)
+
+Build and run on the same architecture: the stub is compiled for your host arch during `cargo build`, and packed binaries run on that arch.
+
 ## Install
 
 ```sh
@@ -64,4 +78,7 @@ crates/
   shellsc/      — CLI
 ```
 
-</content>
+---
+
+#ShellSC #RustLang #ShellScripting #Obfuscation #AntiDebugging #ReverseEngineering #CyberSecurity #LinuxDev #AndroidSecurity #Compiler #OpenSource #GitHub
+
