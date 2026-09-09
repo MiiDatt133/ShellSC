@@ -1709,8 +1709,14 @@ impl Vm {
                 builtins::unset::run(&names, &mut self.env)
             }
             BuiltinId::Exit => {
-                let arg = self.stack.pop()?.into_string();
-                builtins::exit::run(&[arg])
+                let args = self.pop_n(argc)?;
+                let code: i32 = args
+                    .first()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| self.status.code());
+                self.status = ExitStatus::from_code(code);
+                self.exec_terminated = true;
+                return Ok(BuiltinResult::with_out(vec![], self.status));
             }
             BuiltinId::True => BuiltinResult::ok(),
             BuiltinId::False => BuiltinResult::fail(),
