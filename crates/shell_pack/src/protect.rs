@@ -15,7 +15,7 @@ use shell_ast::ShellError;
 pub const PROTECT_MAGIC: &[u8; 12] = b"SHELLSC_PROT";
 
 /// Version byte: bumped on any header-layout change.
-pub const PROTECT_VERSION: u8 = 2;
+pub const PROTECT_VERSION: u8 = 3;
 
 /// magic 12 + version 1 + flags 1 + cff_seed 2 + key 16 + crc32 4 +
 /// orig_len 4 + opmap_seed 4 + opaque_param1 4 + opaque_param2 4 = 52 bytes.
@@ -29,6 +29,10 @@ pub const FLAG_OPAQUE: u8 = 0x10;
 pub const FLAG_SMC: u8 = 0x20;
 pub const FLAG_ANTIHOOK: u8 = 0x40;
 pub const FLAG_SELFDEBUG: u8 = 0x80;
+
+/// Key derivation from ELF .text CRC is active when version >= 3 and
+/// FLAG_ENCRYPTED is set. No separate flag bit needed — all 8 bits are used.
+pub const KEYDERIVE_MIN_VERSION: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtectHeader {
@@ -294,12 +298,43 @@ pub fn revert_opmap(bc_bytes: &mut [u8], inv: &[u8; OPMAP_SIZE]) -> Result<(), S
     Ok(())
 }
 
+// ── Key masking ──────────────────────────────────────────────────────────────
+
+fn mask_key(key: &[u8; 16], text_hash: u32) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for (i, b) in key.iter().enumerate() {
+        out[i] = b ^ (text_hash >> ((i % 4) * 8)) as u8;
+    }
+    out
+}
+
+/// Compute the CRC32 of the ELF stub's executable code (.text section).
+/// Used by both the packer (at build time) and the stub (at runtime) to
+/// derive the same hash without storing it anywhere.
+pub fn text_crc_from_elf(elf_bytes: &[u8]) -> Result<u32, ShellError> {
+    let elf = goblin::elf::Elf::parse(elf_bytes)
+        .map_err(|e| ShellError::IoError(format!("ELF parse: {}", e)))?;
+    for sh in &elf.section_headers {
+        if elf.shdr_strtab.get_at(sh.sh_name) == Some(".text") {
+            let start = sh.sh_offset as usize;
+            let end = start + sh.sh_size as usize;
+            let text = elf_bytes
+                .get(start..end)
+                .ok_or_else(|| ShellError::IoError(".text out of bounds".into()))?;
+            return Ok(crc32(text));
+        }
+    }
+    // No .text section (unlikely): fall back to CRC of entire ELF minus last page.
+    Ok(crc32(elf_bytes))
+}
+
 // ── Seal / open ──────────────────────────────────────────────────────────────
 
 /// Seal the plaintext bytecode into a protected `.shellsc` payload.
-/// Order: shuffle opcodes on the plaintext stream first, then XOR-encrypt
-/// the whole body (header carries key/seed/CRC so the stub can undo both).
-pub fn seal(bc_bytes: &[u8], opts: ProtectOptions) -> Result<Vec<u8>, ShellError> {
+/// `text_hash` is the CRC32 of the ELF stub's .text section; when encrypting,
+/// the key stored in the header is XOR-masked with this hash so the real key
+/// only exists after the stub derives it at runtime from its own code bytes.
+pub fn seal(bc_bytes: &[u8], opts: ProtectOptions, text_hash: u32) -> Result<Vec<u8>, ShellError> {
     let mut rng = Rng::from_entropy();
     let key = rng.key16();
     let seed = rng.next_u32();
@@ -328,10 +363,13 @@ pub fn seal(bc_bytes: &[u8], opts: ProtectOptions) -> Result<Vec<u8>, ShellError
         0
     };
 
+    // Mask the key with the ELF .text hash so it never appears in the file.
+    let stored_key = mask_key(&key, text_hash);
+
     let header = ProtectHeader {
         flags: opts.flags(),
         cff_seed,
-        key,
+        key: stored_key,
         crc32: crc,
         orig_len: bc_bytes.len() as u32,
         opmap_seed: if opts.opmap { seed } else { 0 },
@@ -346,9 +384,9 @@ pub fn seal(bc_bytes: &[u8], opts: ProtectOptions) -> Result<Vec<u8>, ShellError
 }
 
 /// Open a protected payload: returns the decrypted, opcode-restored
-/// bytecode bytes. Verifies CRC32 and length. Returns `None` if the
-/// payload is not protected (plain build) — caller handles that path.
-pub fn open(payload: &[u8]) -> Result<Option<Vec<u8>>, ShellError> {
+/// bytecode bytes. `text_hash` is the CRC32 of the ELF stub's .text section,
+/// used to unmask the key stored in the header (version >= 3).
+pub fn open(payload: &[u8], text_hash: u32) -> Result<Option<Vec<u8>>, ShellError> {
     if !is_protected(payload) {
         return Ok(None);
     }
@@ -356,7 +394,13 @@ pub fn open(payload: &[u8]) -> Result<Option<Vec<u8>>, ShellError> {
     let mut body = payload[HEADER_LEN..].to_vec();
 
     if header.flags & FLAG_ENCRYPTED != 0 {
-        xor_crypt(&header.key, &mut body);
+        let version = payload[12];
+        let real_key = if version >= KEYDERIVE_MIN_VERSION {
+            mask_key(&header.key, text_hash)
+        } else {
+            header.key
+        };
+        xor_crypt(&real_key, &mut body);
     }
 
     if header.flags & FLAG_OPMAP != 0 && header.opmap_seed != 0 {
@@ -539,7 +583,7 @@ mod tests {
                 selfdebug: false,
             },
         ] {
-            let sealed = seal(&bc_bytes, opts).unwrap();
+            let sealed = seal(&bc_bytes, opts, 0).unwrap();
             assert!(is_protected(&sealed));
             // Shuffle must actually change op bytes; encryption must hide
             // the plaintext magic.
@@ -558,7 +602,7 @@ mod tests {
             if opts.encrypt {
                 assert!(!sealed[HEADER_LEN..].starts_with(b"SHBC"));
             }
-            let opened = open(&sealed).unwrap().unwrap();
+            let opened = open(&sealed, 0).unwrap().unwrap();
             assert_eq!(opened, bc_bytes);
         }
     }
@@ -581,21 +625,21 @@ mod tests {
             antihook: false,
             selfdebug: false,
         };
-        let sealed = seal(&bc_bytes, opts).unwrap();
+        let sealed = seal(&bc_bytes, opts, 0).unwrap();
         // Ciphertext == shuffled plaintext (no XOR).
         assert!(sealed[HEADER_LEN..].starts_with(b"SHBC"));
-        let opened = open(&sealed).unwrap().unwrap();
+        let opened = open(&sealed, 0).unwrap().unwrap();
         assert_eq!(opened, bc_bytes);
     }
 
     #[test]
     fn tampered_body_fails_integrity() {
         let bc_bytes = sample_shbc();
-        let sealed = seal(&bc_bytes, ProtectOptions::all()).unwrap();
+        let sealed = seal(&bc_bytes, ProtectOptions::all(), 0).unwrap();
         let mut tampered = sealed.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 0xFF;
-        let err = open(&tampered).err().unwrap().to_string();
+        let err = open(&tampered, 0).err().unwrap().to_string();
         assert!(err.contains("integrity") || err.contains("opcode"), "{err}");
     }
 }

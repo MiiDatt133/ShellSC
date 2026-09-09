@@ -7,6 +7,10 @@ use crate::{
     protect::{seal, ProtectOptions},
 };
 
+fn compute_stub_text_crc(stub: &[u8]) -> u32 {
+    crate::protect::text_crc_from_elf(stub).unwrap_or(0)
+}
+
 pub struct Packer;
 
 const SECTION_NAME: &[u8] = b".shellsc\0";
@@ -32,9 +36,10 @@ impl Packer {
         if !opts.is_any() {
             return self.pack(bc_bytes);
         }
-        let sealed = seal(bc_bytes, opts)?;
         let stub = stub_bytes()?;
         validate_stub(&stub)?;
+        let text_crc = compute_stub_text_crc(&stub);
+        let sealed = seal(bc_bytes, opts, text_crc)?;
         inject_section(&stub, &sealed)
     }
 

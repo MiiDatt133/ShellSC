@@ -70,7 +70,9 @@ fn run() -> Result<()> {
                 if header.flags & shell_pack::protect::FLAG_SELFDEBUG != 0 {
                     selfdebug_check()?;
                 }
-                let bc = shell_pack::open(payload)
+                let text_crc = shell_pack::protect::text_crc_from_elf(&bytes)
+                    .unwrap_or(0);
+                let bc = shell_pack::open(payload, text_crc)
                     .map_err(|e| anyhow::anyhow!("unsealing bytecode: {}", e))?
                     .context("protected payload too short")?;
                 header_opt = Some(header);
