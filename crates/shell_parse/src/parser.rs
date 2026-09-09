@@ -1136,6 +1136,28 @@ impl Parser {
                     modifier: None,
                     span,
                 }));
+            } else if next == Some('$') {
+                // `${#$''}`: bash glues `${#}` ($# itself) with an empty
+                // `$''` expansion inside one pair of braces.
+                chars.next(); // consume '$'
+                let mut tail = String::from("$");
+                let mut closed = false;
+                while let Some(&(_, c)) = chars.peek() {
+                    if c == '}' {
+                        chars.next();
+                        closed = true;
+                        break;
+                    }
+                    tail.push(c);
+                    chars.next();
+                }
+                if !closed || tail != "$''" {
+                    return Err(ShellError::parse(
+                        span,
+                        "expected variable name or '}' after ${#",
+                    ));
+                }
+                return Ok(WordPart::Var("#".to_string()));
             } else {
                 return Err(ShellError::parse(
                     span,
@@ -1144,9 +1166,11 @@ impl Parser {
             }
         }
 
-        // Other special single-char variables: $*, $@, $?, $!, $$, $-, $0
+        // Other special single-char variables: $*, $@, $?, $!, $$, $-
+        // (digits are NOT intercepted here — they fall through to the regular
+        // name path so `${1:-default}` and `${0:+x}` parse with modifiers).
         if let Some(&(_, c)) = chars.peek() {
-            if is_special_var(c) {
+            if is_special_var(c) && !c.is_ascii_digit() {
                 chars.next();
                 match chars.next() {
                     Some((_, '}')) => {}

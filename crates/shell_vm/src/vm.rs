@@ -34,6 +34,10 @@ pub fn set_sigterm() {
 struct CallFrame {
     return_ip: usize,
     saved_redirs: Vec<RedirSpec>,
+    /// Pending redirects that existed at call time (call-site redirs).
+    /// Statement-level redirects inside the body are discarded after each
+    /// statement; the set is restored to this baseline.
+    base_redirs: Vec<RedirSpec>,
 }
 
 pub struct Vm {
@@ -62,6 +66,10 @@ pub struct Vm {
     glob_deficit: usize,
     /// Stdin data piped from a previous pipeline stage (consumed line-by-line by `read`).
     pending_stdin: Option<std::io::Cursor<Vec<u8>>>,
+    /// Background function-call child VMs — `wait` joins them all.
+    bg_handles: Vec<std::thread::JoinHandle<()>>,
+    /// Receiver of the last spawned bg child's done-signal (spawn-order chaining).
+    bg_chain: Option<std::sync::mpsc::Receiver<()>>,
     /// When set, run() stops when ip reaches this value (used for inline subshell stages).
     ip_fence: Option<usize>,
     trap_exit: builtins::trap::TrapDisposition,
@@ -128,6 +136,8 @@ impl Vm {
             glob_surplus: 0,
             glob_deficit: 0,
             pending_stdin: None,
+            bg_handles: vec![],
+            bg_chain: None,
             ip_fence: None,
             trap_exit: builtins::trap::TrapDisposition::Default,
             trap_int: builtins::trap::TrapDisposition::Default,
@@ -684,8 +694,17 @@ impl Vm {
                         if !result.out.is_empty() {
                             self.write_out(&result.out);
                         }
-                        if self.call_stack.is_empty() && self.redir_stack.is_empty() {
-                            self.pending_redirs.clear();
+                        // Statement-level redirects die with the statement.
+                        // Inside a function call the baseline is the call-site
+                        // redirect set, not empty.
+                        if self.redir_stack.is_empty() {
+                            match self.call_stack.last() {
+                                None => self.pending_redirs.clear(),
+                                Some(frame) => {
+                                    let base = frame.base_redirs.clone();
+                                    self.pending_redirs = base;
+                                }
+                            }
                         }
                         self.update_status(result.status);
                         if self.exec_terminated {
@@ -726,7 +745,13 @@ impl Vm {
                             Ok((out, st)) => {
                                 self.write_out(&out);
                                 if self.redir_stack.is_empty() {
-                                    self.pending_redirs.clear();
+                                    match self.call_stack.last() {
+                                        None => self.pending_redirs.clear(),
+                                        Some(frame) => {
+                                            let base = frame.base_redirs.clone();
+                                            self.pending_redirs = base;
+                                        }
+                                    }
                                 }
                                 self.update_status(st);
                             }
@@ -738,7 +763,18 @@ impl Vm {
                         let redirs = self.take_redirs();
                         let saved_specs = redirs.specs.clone();
                         match spawn_command(&argv, redirs) {
-                            Ok(st) => self.update_status(st),
+                            Ok(st) => {
+                                self.update_status(st);
+                                if self.redir_stack.is_empty() {
+                                    match self.call_stack.last() {
+                                        None => self.pending_redirs.clear(),
+                                        Some(frame) => {
+                                            let base = frame.base_redirs.clone();
+                                            self.pending_redirs = base;
+                                        }
+                                    }
+                                }
+                            }
                             Err(e) => {
                                 // Restore redirs so the error message honours
                                 // e.g. `cmd 2>/dev/null`.
@@ -762,12 +798,35 @@ impl Vm {
                         let mut child =
                             Vm::new_child(self.bc.clone(), self.env.snapshot(), self.smc.clone());
                         child.func_table = self.func_table.clone();
-                        child.pending_redirs = redirs.specs;
+                        child.pending_redirs = redirs.specs.clone();
                         child.env.push_frame(&argv[1..].to_vec());
                         child.ip = entry_ip as usize;
-                        std::thread::spawn(move || {
-                            let _ = child.run();
+                        // Sentinel frame: keeps call_stack non-empty so the
+                        // per-statement pending_redirs restore inside Builtin
+                        // dispatch resets to the call-site baseline instead of
+                        // clearing it (every statement must see the call-site
+                        // redirects, but only those).
+                        child.call_stack.push(CallFrame {
+                            return_ip: usize::MAX,
+                            saved_redirs: vec![],
+                            base_redirs: redirs.specs,
                         });
+                        // Chain background children: each waits for the
+                        // previous one to finish before running, so same-file
+                        // appends from multiple queued bg calls land in spawn
+                        // order (bash starts `&` processes sequentially too).
+                        let prev = self.bg_chain.take();
+                        let (tx, rx) = std::sync::mpsc::channel::<()>();
+                        self.bg_chain = Some(rx);
+                        let handle = std::thread::spawn(move || {
+                            if let Some(prev_rdy) = prev {
+                                // Wait for the prior child to signal done.
+                                let _ = prev_rdy.recv();
+                            }
+                            let _ = child.run();
+                            let _ = tx.send(());
+                        });
+                        self.bg_handles.push(handle);
                     } else if let Err(e) = spawn_background(&argv, redirs) {
                         self.handle_exec_error(&argv[0], e);
                     }
@@ -802,8 +861,16 @@ impl Vm {
                 Opcode::FuncReturn => {
                     if let Some(frame) = self.call_stack.pop() {
                         self.env.pop_frame();
-                        self.pending_redirs = frame.saved_redirs;
                         self.ip = frame.return_ip;
+                        if self.call_stack.is_empty() {
+                            // Call-site redirects (`fn > a 2> b`) die with the
+                            // call — the next statement starts with a clean
+                            // pending set (they were only saved so nested
+                            // statements inside the body wouldn't clear them).
+                            self.pending_redirs.clear();
+                        } else {
+                            self.pending_redirs = frame.saved_redirs;
+                        }
                     } else {
                         return Ok(self.status);
                     }
@@ -1360,6 +1427,7 @@ impl Vm {
                     self.call_stack.push(CallFrame {
                         return_ip: saved_ip,
                         saved_redirs: self.pending_redirs.clone(),
+                        base_redirs: self.pending_redirs.clone(),
                     });
                     self.ip = entry_ip as usize;
                     let _ = self.run();
@@ -1424,6 +1492,50 @@ impl Vm {
         for (i, stage) in segments.into_iter().enumerate() {
             let is_last = i + 1 == n;
             match stage {
+                PipelineStage::External {
+                    ref argv,
+                    ref redirs,
+                } if argv
+                    .first()
+                    .and_then(|a| self.func_table.get(a.as_str()))
+                    .is_some() =>
+                {
+                    // Function call in a pipeline: run it in a child VM like
+                    // a subshell stage (bash runs pipeline functions in a
+                    // subshell), feeding piped stdin and capturing stdout.
+                    let argv = argv.clone();
+                    let redirs = redirs.clone();
+                    let entry_ip = *self.func_table.get(&argv[0]).unwrap() as usize;
+                    let mut child =
+                        Vm::new_child(self.bc.clone(), self.env.snapshot(), self.smc.clone());
+                    child.func_table = self.func_table.clone();
+                    let pipe_input = stdin_buf
+                        .as_deref()
+                        .filter(|_| !redirs.specs.iter().any(|s| s.fd == 0))
+                        .map(|d| d.to_vec());
+                    child.pending_stdin = pipe_input.map(std::io::Cursor::new);
+                    child.pending_redirs = redirs.specs.clone();
+                    child.env.push_frame(&argv[1..].to_vec());
+                    child.capture_stack.push(vec![]);
+                    child.ip = entry_ip;
+                    child.call_stack.push(CallFrame {
+                        return_ip: usize::MAX,
+                        saved_redirs: vec![],
+                        base_redirs: redirs.specs,
+                    });
+                    let _ = child.run();
+                    let out = child.capture_stack.pop().unwrap_or_default();
+                    last_status = child.status;
+                    if is_last && !capture_out {
+                        if !out.is_empty() {
+                            let _ = std::io::stdout().write_all(&out);
+                            let _ = std::io::stdout().flush();
+                        }
+                        stdin_buf = None;
+                    } else {
+                        stdin_buf = Some(out);
+                    }
+                }
                 PipelineStage::External { argv, redirs } => {
                     let capture_output = !is_last || capture_out;
                     let input = stdin_buf
@@ -1666,7 +1778,8 @@ impl Vm {
         let saved_redirs = self.pending_redirs.clone();
         self.call_stack.push(CallFrame {
             return_ip: self.ip,
-            saved_redirs,
+            saved_redirs: saved_redirs.clone(),
+            base_redirs: saved_redirs,
         });
         self.ip = entry_ip as usize;
         Ok(())
@@ -1690,22 +1803,15 @@ impl Vm {
             }
             BuiltinId::Read => {
                 let names = self.pop_n(argc)?;
-                let stdin_file = self
-                    .pending_redirs
-                    .iter()
-                    .find(|r| r.fd == 0)
-                    .and_then(|r| match &r.target {
-                        RedirTargetSpec::File(p) => Some(p.clone()),
-                        _ => None,
-                    });
-                let redir_stdin_data =
-                    self.pending_redirs
-                        .iter()
-                        .find(|r| r.fd == 0)
-                        .and_then(|r| match &r.target {
-                            RedirTargetSpec::HereDoc(b) => Some(b.as_bytes().to_vec()),
-                            _ => None,
-                        });
+                let stdin_redir = self.pending_redirs.iter().find(|r| r.fd == 0).cloned();
+                let stdin_file = stdin_redir.as_ref().and_then(|r| match &r.target {
+                    RedirTargetSpec::File(p) => Some(p.clone()),
+                    _ => None,
+                });
+                let redir_stdin_data = stdin_redir.as_ref().and_then(|r| match &r.target {
+                    RedirTargetSpec::HereDoc(b) => Some(b.as_bytes().to_vec()),
+                    _ => None,
+                });
                 self.pending_redirs.retain(|r| r.fd != 0);
                 // Explicit heredoc redirect takes priority over piped stdin cursor.
                 // A fresh here-string always replaces the cursor: the previous
@@ -1715,17 +1821,22 @@ impl Vm {
                     return Ok(builtins::read::run(
                         &names,
                         &mut self.env,
-                        stdin_file,
+                        None,
                         self.pending_stdin.as_mut(),
                     ));
                 }
-                // Piped stdin cursor persists across multiple reads (for while loops).
-                builtins::read::run(
-                    &names,
-                    &mut self.env,
-                    stdin_file,
-                    self.pending_stdin.as_mut(),
-                )
+                // A file redirect must persist across loop iterations: load the
+                // whole file into the cursor once so later reads continue where
+                // the previous stopped (bash `while read < file` semantics).
+                if let Some(path) = stdin_file {
+                    match std::fs::read(&path) {
+                        Ok(bytes) => {
+                            self.pending_stdin = Some(std::io::Cursor::new(bytes));
+                        }
+                        Err(_) => return Ok(BuiltinResult::fail()),
+                    }
+                }
+                builtins::read::run(&names, &mut self.env, None, self.pending_stdin.as_mut())
             }
             BuiltinId::Test => {
                 let args = self.pop_n(argc)?;
@@ -1992,7 +2103,13 @@ impl Vm {
             // wait [pid…] — wait for all background jobs (or specific PIDs).
             BuiltinId::Wait => {
                 let _ = self.pop_n(argc)?;
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                // Join all background function-call children (external bg
+                // processes are reaped by the OS; the shell-level `&`
+                // function VMs are the ones we own).
+                self.bg_chain = None;
+                for h in self.bg_handles.drain(..) {
+                    let _ = h.join();
+                }
                 BuiltinResult::ok()
             }
 
@@ -2216,8 +2333,27 @@ impl Vm {
     }
 
     /// Resolve one `${...}` occurrence inside a heredoc body, including
-    /// array forms: `${arr[i]}`, `${arr[@]}`, `${arr[*]}`, `${#arr[@]}`.
+    /// array forms: `${arr[i]}`, `${arr[@]}`, `${arr[*]}`, `${#arr[@]}`,
+    /// and `:-`/`-` default forms: `${var:-def}`, `${1:-def}`.
     fn expand_heredoc_brace(&self, inner: &str) -> String {
+        // Default forms first: `:-` (unset-or-empty) and `-` (unset).
+        if let Some(op_at) = find_default_op(inner) {
+            let name = &inner[..op_at];
+            let (op, def) = split_default_op(&inner[op_at..]);
+            let cur = self.env.get_scalar_or_array0(name);
+            let empty = match cur {
+                Some(v) => v.is_empty(),
+                None => true,
+            };
+            let use_default = match op {
+                ":-" => empty,
+                _ => cur.is_none(), // `-`
+            };
+            if use_default {
+                return def.to_string();
+            }
+            return cur.unwrap_or("").to_string();
+        }
         // Length form: ${#arr[@]} / ${#var}
         let (is_len, expr) = if let Some(rest) = inner.strip_prefix('#') {
             (true, rest)
@@ -2265,6 +2401,19 @@ impl Vm {
         let mut i = 0;
         while i < bytes.len() {
             if bytes[i] == b'$' && i + 1 < bytes.len() {
+                // `$(cmd)` command substitution: find the matching close paren
+                // (balance nested $(...) runs), compile and run it in a
+                // capture subshell, strip trailing newlines.
+                if bytes[i + 1] == b'(' {
+                    if let Some((cmd, next)) = find_cmdsub_end(body, i + 2) {
+                        if let Ok((_, cap)) = self.eval_pipeline_subshell(&cmd, None) {
+                            let text = String::from_utf8_lossy(&cap);
+                            out.push_str(text.trim_end_matches('\n'));
+                        }
+                        i = next;
+                        continue;
+                    }
+                }
                 match bytes[i + 1] {
                     b'{' => {
                         if let Some(rel) = body[i + 2..].find('}') {
@@ -2311,6 +2460,66 @@ impl Vm {
             }
         }
         out
+    }
+}
+
+/// Find the end of a `$(...)` command substitution starting at byte
+/// `start` (just past the open paren). Returns (cmd, index after `)`),
+/// balancing nested paren runs. A `$(` inside also nests.
+fn find_cmdsub_end(body: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = body.as_bytes();
+    let mut depth = 1;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((body[start..i].to_string(), i + 1));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Byte offset of a `:-` / `-` default operator inside `${name...}`,
+/// skipping `#` and `[...]` so `${#arr[@]}` / `${arr[i]:-d}` stay intact.
+fn find_default_op(inner: &str) -> Option<usize> {
+    let bytes = inner.as_bytes();
+    let mut i = 0;
+    // Skip a leading `#` (length form has no default).
+    if !bytes.is_empty() && bytes[0] == b'#' {
+        return None;
+    }
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' => {
+                // Skip the array index to its closing bracket.
+                match bytes[i..].iter().position(|&b| b == b']') {
+                    Some(rel) => i += rel + 1,
+                    None => return None,
+                }
+            }
+            b':' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => return Some(i),
+            b'-' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Split the operator tail `:-def` or `-def` into (":-", "def").
+fn split_default_op(tail: &str) -> (&'static str, &str) {
+    if let Some(def) = tail.strip_prefix(":-") {
+        (":-", def)
+    } else if let Some(def) = tail.strip_prefix('-') {
+        ("-", def)
+    } else {
+        ("-", "")
     }
 }
 

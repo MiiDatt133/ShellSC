@@ -169,3 +169,166 @@ echo "${arr[i+1]}"
 
 d23–d42 (20 scripts). PASS: d23, d24, d26, d27, d28, d29, d30, d31, d32, d33, d34, d37, d39, d40, d41, d42 (16). FAIL: d25, d35, d36, d38 (4).
 All .sh files kept as regression tests. All .sc and temp output files cleaned up.
+
+## Round f — ANSI-C quoting, heredoc params, bg functions, read -a, stdin cursor
+
+Scripts f1–f48 (batch tests plus minimal isolations). Clean PASS: f5, f8, f10, f11, f14, f17, f22, f28, f33, f36, f39, f41, f45, f46. DIVERGE: f1, f2, f3, f4, f6, f7, f9, f12, f13, f15, f16, f18, f19, f20, f21, f23, f24, f25, f26, f27, f29, f30, f31, f34, f35, f37, f38, f40, f42, f43, f44, f47, f48 (some of these batch scripts contain multiple divergences, each isolated below).
+
+### D-F-01 (f1, f31): Default $IFS missing tab
+
+    printf '%s\n' "$IFS" | od -c   # fresh run, no prior assignment
+
+- bash: " \t \n" (space, tab, newline)
+- sc: " \n" (space, newline — no tab)
+- Diagnosis: crates/shell_vm — VM-level default IFS constant is " \n" not " \t\n". Note read.rs lines 74/87 default " \t\n" are correct; only the general env default differs. Affects all field splitting until user assigns IFS.
+
+### D-F-02 (f2, f3, f34): Panic on NUL value from \0 / octal \0
+
+    c=$'\0'
+    printf 'len:%s\n' "${#c}"
+
+- bash: len:0
+- sc: thread 'main' panicked at env.rs:362: failed to set environment variable "c" to "\0": file name contained an unexpected NUL byte — whole process aborts
+- Diagnosis: shell_vm SetVar or export path calls std::env::set_var with NUL in value. Shell semantics drop NUL; must truncate or ignore, never panic.
+
+### D-F-03 (f21, f27): \cX control escapes not decoded
+
+    printf '%s' $'\ca' | od -An -c   # want 001
+    printf '%s' $'\cA' | od -An -c   # want 001
+    printf '%s' $'\c[' | od -An -c   # want 033 (ESC)
+
+- sc emits literal backslash-c-X ( \ c a ) for all three
+- Diagnosis: crates/shell_lex/src/lexer.rs read_ansi_c_body — \c control form unimplemented. Bash: \cX = X & 0x1F.
+
+### D-F-04 (f6, f29, f42): \' inside $'...' dropped, not emitted
+
+    printf '%s' $'a\'b' | od -An -c   # bash: a ' b ; sc: a b
+    printf '%s' $'it\'s' | od -An -c  # bash: i t ' s ; sc: i t s
+
+- Also $'a\'b'c mid-word (f42).
+- Diagnosis: crates/shell_lex/src/lexer.rs read_ansi_c_body — \' branch consumes both chars but emits nothing (likely stops scan as if string terminated).
+
+### D-F-05 (f7): Heredoc with $'...' delimiter — build fails
+
+    read -r line <<$'END\tX'
+    hello
+    $'END\tX'
+    echo "line:$line"
+
+- bash: warns unterminated, prints line:$'END\tX'
+- sc: Error: lex error at 11:1: unterminated heredoc for delimiter 'END\tX' — build fails
+- Diagnosis: crates/shell_lex/src/lexer.rs heredoc delimiter scan does not understand $'...' as delimiter word (bash: quoted delimiter, no expansion, tab is literal part of delimiter).
+
+### D-F-06 (f15, f24): <<$'EOF' delimiter treated as EXPANDING heredoc
+
+    cat <<$'END'
+    literal $1 $(x) $HOME
+    END
+
+- bash: literal $1 $(x) $HOME ($'...' delimiter ⇒ quoted heredoc, no expansion)
+- sc: literal  $(x) /home/... ($HOME expanded, $1 empty)
+- Diagnosis: crates/shell_lex/src/lexer.rs delimiter classification — $'...' must set the quoted/no-expand heredoc flag like '...' does.
+
+### D-F-07 (f9): $0 inside heredoc
+
+- bash: zero=difftest/f9.sh, sc: zero=./f9.sc — expected $0 difference, NOT a bug. Excluded.
+
+### D-F-08 (f12, f48): read without -r keeps backslashes literal
+
+    printf 'a\\tb\n' | { read -a arr; echo "0:[${arr[0]}]"; }    # bash: [atb], sc: [a\tb]
+    printf 'x\\ y\n' | { read -a arr; echo "0:[${arr[0]}]:1:[${arr[1]}]"; }  # bash: [x y]:[], sc: [x\]:[y]
+
+- Diagnosis: crates/shell_vm/src/builtins/read.rs — -r flag parsed but unused; no backslash-escape processing exists for non-raw read.
+
+### D-F-09 (f13, f30): read does not trim leading/trailing IFS whitespace
+
+    read -r z <<< "  spaces  "     # bash: [spaces], sc: [  spaces  ]
+    read -r p q <<< "  a  b  "    # bash: p:[a] q:[b], sc: p:[] q:[a  b  ]
+
+- Diagnosis: crates/shell_vm/src/builtins/read.rs line 93 — only trim_start_matches on splitn fields; single-var whole-line read never trimmed; no trailing strip at all.
+
+### D-F-10 (f13, f25, f40): while read from < file processes only first line
+
+    printf 'A\nB\nC\n' > f40in.txt
+    while read -r l; do
+      echo "got:$l"
+    done < f40in.txt
+
+- bash: got:A got:B got:C ; sc: got:A only
+- Diagnosis: crates/shell_vm/src/vm.rs Read builtin / loop stdin: file-redirect stdin reopened or cursor reset each iteration, or remainder discarded after first read. Piped while-read (f41) and here-string while-read (f33) PASS — only < file form broken.
+
+### D-F-11 (f15, f20): $( ) command substitution in unquoted heredoc body not expanded
+
+    cat <<EOF
+    expand:$(echo inline)
+    EOF
+
+- bash: expand:inline ; sc: expand:$(echo inline)
+- Diagnosis: crates/shell_vm/src/vm.rs expand_heredoc_body — handles $1..$9 $# $* $@ $? $$ $0 but not command substitution (and see D-F-16 for ${} forms). Same construct at top level (f28) works; gap is heredoc-body-expander-specific.
+
+### D-F-12 (f16, f26, f47): bg function 2> redirect lost, stderr leaks to parent
+
+    o() { echo "O"; echo "E" >&2; }
+    o > f47o.txt 2> f47e.txt &
+    wait
+
+- bash: f47o.txt=O, f47e.txt=E, console clean
+- sc: E printed to console, f47e.txt never created, result o:[O]e:[]
+- Diagnosis: crates/shell_vm/src/vm.rs Opcode::ExecExternalBg child — only stdout redirect transferred; stderr/fd2 redirects dropped.
+
+### D-F-13 (f38): two bg calls in one list — second loses function
+
+    p() { echo "pl"; }
+    p & p &
+    wait
+
+- bash: pl twice ; sc: first OK, second → shellsc: p: command not found
+- Diagnosis: crates/shell_vm/src/vm.rs ExecExternalBg — pending-bg state clobbered after first spawn in same AND-OR list. Two separate lines (f39) PASS.
+
+### D-F-14 (f19, f23, f35): unquoted case subject with IFS char splits
+
+    v=$'x\ty'
+    case $v in
+      *$'\t'*) echo M1 ;;
+      *) echo N1 ;;
+    esac
+
+- bash: M1 ; sc: "x N1" (subject split at tab: x matched * arm; leftover field pollutes echo args)
+- Diagnosis: crates/shell_vm — GlobExpand on case subject does field splitting; CaseBegin pops one field, leftovers corrupt stack. IR shows PushVar("v") GlobExpand CaseBegin. Lowering should suppress split for case subject or VM consume all fields.
+
+### D-F-15 (f44): ${N:-default} positional with modifier — parse error
+
+    set -- A B
+    echo "${1:-D}"
+
+- bash: A ; sc: Error: parse error at 3:6: expected '}' — BUILD FAILS
+- Diagnosis: crates/shell_parse/src/parser.rs is_special_var includes digits; after consuming special char the parser demands immediate '}' — no modifier path for positionals (${1:?} ${1:+} ${1-D} ${3:+SET} all fail). Named ${x:-D} works.
+
+### D-F-16 (f37, f43): ${1:-default} inside heredoc expands empty
+
+    f() { cat <<EOF
+    d:${1:-DEFAULT}
+    EOF
+    }
+    f X    # bash: d:X, sc: d:
+
+- Diagnosis: crates/shell_vm/src/vm.rs expand_heredoc_body — brace param-expansion forms (${...}) not implemented in heredoc expander; only bare $1-style.
+
+### D-F-17 (f18, f32): <(...) process substitution in redirect — parse error
+
+    read b < <(echo second)
+
+- bash: b=second ; sc: Error: unexpected token '<' at 3:10 — build fails
+- Diagnosis: crates/shell_parse/src/parser.rs — process substitution unsupported in redirect position. Pre-existing gap surfaced by stdin-cursor tests. Rest of f18 (here-string cursor chains) passes when procsub line removed.
+
+### Verified OK (no divergence)
+
+- ANSI-C: \t \n \r \a \b \e \E \f \v \\ \" \? octal \0NNN (incl \1011 → A1), hex \xHH \x7f, empty $'', unknown escapes \q \z literal, concat pre$'x'post, "$var"$'\n', as args, IFS=$'...' assignment, for-loop items, printf $'fmt' (f5 f14 f22 f36)
+- Heredoc positional params: $1..$9 $# $* $@ $? in unquoted heredoc; quoted <<'EOF' correctly NOT expanding; heredoc in function with locals; after set --; here-strings with $1 (f8, f9 minus $0)
+- bg functions: args myfn a b &, file writes, stdout > redirect, subshell var isolation, bg external sleep 0.05 &, bg fn in pipeline, bg fn with heredoc inside (f10 f11 f45 f46; f38 partial)
+- read -a: -r -a, combined -ra, IFS variants (: and tab), piped stdin, heredoc redirect stdin, empty line, multiple/leading/trailing spaces in -a mode (f12 minus backslash, f17)
+- stdin cursor: consecutive here-strings read x <<< v1; read y <<< v2, while-read with here-string, piped while-read (f13 partial, f33, f41)
+
+## Round f scripts
+
+f1–f48 kept as .sh regression tests. .sc and output .txt files removed after recording.

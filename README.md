@@ -1,5 +1,9 @@
 # ShellSC
 
+![Rust](https://img.shields.io/badge/Rust-1.70%2B-orange)
+![License](https://img.shields.io/badge/License-BSD%203--Clause-blue)
+![Platform](https://img.shields.io/badge/Platform-ARM%20%7C%20x86-green)
+
 Shell script compiler for Android and Linux. Compiles `.sh` scripts into standalone ELF executables.
 
 ## Requirements
@@ -52,7 +56,9 @@ chmod +x script.sc && ./script.sc
 
 ## Supported Syntax
 
-Pipelines, subshells, brace groups, `if/elif/else`, `while/until/for/case`, functions, arrays (`arr=(a b)`, `${arr[@]}`, `${#arr[@]}`, `arr[i]=v`, `arr+=(...)`, `unset arr[i]`, `read -a arr`), command substitution `$(cmd)`, arithmetic `$((expr))`, heredocs, here-strings, glob/brace expansion, parameter expansion (`:-`, `:=`, `:+`, `:?`, `#pat`, `%pat`, `##pat`, `%%pat`, substring), `trap` (string or function name, incl. `trap myfn EXIT`), `eval`, `exec`, `local`, `shift`, redirects (`>`, `>>`, `<`, `2>&1`, etc.), background `&` (external commands and shell functions), boolean `&&`/`||`.
+Pipelines, subshells, brace groups, `if/elif/else`, `while/until/for/case`, functions, arrays (`arr=(a b)`, `${arr[@]}`, `${#arr[@]}`, `arr[i]=v`, `arr+=(...)`, `unset arr[i]`, `read -a arr`), command substitution `$(cmd)`, arithmetic `$((expr))`, heredocs, here-strings, glob/brace expansion, ANSI-C quoting `$'\t'` / `$'\x41'`, parameter expansion (`:-`, `:=`, `:+`, `:?`, `#pat`, `%pat`, `##pat`, `%%pat`, substring), `trap` (string or function name, incl. `trap myfn EXIT`), `eval`, `exec`, `local`, `shift`, redirects (`>`, `>>`, `<`, `2>&1`, etc.), background `&` (external commands and shell functions), boolean `&&`/`||`.
+
+Not supported: process substitution `<(cmd)`, associative arrays (`declare -A`), coprocesses.
 
 ## Protection (`--protect`)
 

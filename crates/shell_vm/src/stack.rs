@@ -9,7 +9,14 @@ pub enum Value {
 impl Value {
     pub fn into_string(self) -> String {
         match self {
-            Value::Str(s) => s,
+            Value::Str(s) => {
+                // Shell semantics: NUL cannot live in a string — truncate at
+                // the first one (bash drops $'\0' to empty).
+                match s.find('\0') {
+                    Some(i) => s[..i].to_string(),
+                    None => s,
+                }
+            }
         }
     }
 

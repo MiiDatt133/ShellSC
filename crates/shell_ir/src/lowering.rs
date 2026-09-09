@@ -724,7 +724,9 @@ impl Lowerer {
     }
 
     fn lower_case(&mut self, c: &CaseStmt) -> Result<(), ShellError> {
-        self.lower_word(&c.word)?;
+        // bash never field-splits or globs the case subject — lower it
+        // without the GlobExpand pass.
+        self.lower_word_single_parts(&c.word.parts)?;
         self.chunk.push(IrOp::CaseBegin);
         let mut end_holes: Vec<usize> = vec![];
         let mut prev_fail_hole: Option<usize> = None;

@@ -1,5 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
+/// `std::env::set_var` panics on values containing NUL. Bash truncates at
+/// the first NUL when exporting — do the same instead of aborting.
+fn safe_set_var(name: &str, value: &str) {
+    let v = match value.find('\0') {
+        Some(i) => &value[..i],
+        None => value,
+    };
+    std::env::set_var(name, v);
+}
+
 /// Shell variable environment with proper lexical scope isolation.
 ///
 /// The environment is a stack of frames:
@@ -34,7 +44,11 @@ impl Default for Env {
 impl Env {
     /// Create a new environment initialised from the current process environment.
     pub fn new() -> Self {
-        let global: HashMap<String, String> = std::env::vars().collect();
+        let mut global: HashMap<String, String> = std::env::vars().collect();
+        // bash default IFS: space, tab, newline (unless inherited set).
+        global
+            .entry("IFS".to_string())
+            .or_insert_with(|| " \t\n".to_string());
         let exported: HashSet<String> = global.keys().cloned().collect();
         Self {
             frames: vec![global],
@@ -90,7 +104,7 @@ impl Env {
             self.array_set_index(&name, 0, value);
             return;
         }
-        std::env::set_var(&name, &value);
+        safe_set_var(&name, &value);
         for frame in self.frames.iter_mut().rev() {
             if frame.contains_key(&name) {
                 frame.insert(name, value);
@@ -106,7 +120,7 @@ impl Env {
         let name = name.into();
         let value = value.into();
         if self.exported.contains(&name) {
-            std::env::set_var(&name, &value);
+            safe_set_var(&name, &value);
         }
         if let Some(frame) = self.frames.last_mut() {
             frame.insert(name, value);
@@ -144,7 +158,7 @@ impl Env {
             self.set(name, v);
         }
         let val = self.get(name).unwrap_or("").to_string();
-        std::env::set_var(name, &val);
+        safe_set_var(name, &val);
         self.exported.insert(name.to_string());
     }
 
@@ -205,7 +219,7 @@ impl Env {
             for name in frame.keys() {
                 if self.exported.contains(name.as_str()) {
                     let outer = self.get(name).unwrap_or("");
-                    std::env::set_var(name, outer);
+                    safe_set_var(name, outer);
                 }
             }
         }
@@ -379,7 +393,7 @@ impl Env {
             let saved_val = saved.get(k).unwrap_or("");
             let curr_val = self.get(k).unwrap_or("");
             if saved_val != curr_val {
-                std::env::set_var(k, saved_val);
+                safe_set_var(k, saved_val);
             }
         }
         *self = saved;

@@ -323,6 +323,9 @@ impl<'a> Lexer<'a> {
         start_col: u32,
     ) -> Result<Token, ShellError> {
         let mut s = String::new();
+        // Decoded $'...' text pending emission as its own SingleQuoted token.
+        let mut ansi_standalone: Option<String> = None;
+        let mut ansi_span_start: Option<usize> = None;
         loop {
             match self.cursor.peek() {
                 None | Some('\n') | Some(' ') | Some('\t') | Some('\r') | Some(';') | Some('&')
@@ -388,31 +391,47 @@ impl<'a> Lexer<'a> {
 
                 Some('$') => {
                     self.cursor.advance();
-                    s.push('$');
-                    if self.cursor.peek() == Some('(') {
+                    // ANSI-C quoting: $'...' — escapes decoded at lex time.
+                    // The decoded text is emitted as its own SingleQuoted token
+                    // so the parser keeps it literal (a Word would re-interpret
+                    // embedded quotes/expansions).
+                    if self.cursor.peek() == Some('\'') {
+                        // Span starts at the `$` so the ANSI token stays
+                        // adjacent to the previous token for merge purposes.
+                        let ansi_start = self.cursor.pos() - 1;
                         self.cursor.advance();
-                        s.push('(');
-                        read_cmd_sub_body(&mut self.cursor, &mut s);
-                    } else if self.cursor.peek() == Some('{') {
-                        // ${var}, ${var:-default}, ${#var}, etc. — read to matching '}'
-                        self.cursor.advance();
-                        s.push('{');
-                        let mut depth = 1usize;
-                        loop {
-                            match self.cursor.advance() {
-                                None => break,
-                                Some('{') => {
-                                    depth += 1;
-                                    s.push('{');
-                                }
-                                Some('}') => {
-                                    depth -= 1;
-                                    s.push('}');
-                                    if depth == 0 {
-                                        break;
+                        let mut decoded = String::new();
+                        read_ansi_c_body(&mut self.cursor, &mut decoded);
+                        ansi_standalone = Some(decoded);
+                        ansi_span_start = Some(ansi_start);
+                        break;
+                    } else {
+                        s.push('$');
+                        if self.cursor.peek() == Some('(') {
+                            self.cursor.advance();
+                            s.push('(');
+                            read_cmd_sub_body(&mut self.cursor, &mut s);
+                        } else if self.cursor.peek() == Some('{') {
+                            // ${var}, ${var:-default}, ${#var}, etc. — read to matching '}'
+                            self.cursor.advance();
+                            s.push('{');
+                            let mut depth = 1usize;
+                            loop {
+                                match self.cursor.advance() {
+                                    None => break,
+                                    Some('{') => {
+                                        depth += 1;
+                                        s.push('{');
                                     }
+                                    Some('}') => {
+                                        depth -= 1;
+                                        s.push('}');
+                                        if depth == 0 {
+                                            break;
+                                        }
+                                    }
+                                    Some(c) => s.push(c),
                                 }
-                                Some(c) => s.push(c),
                             }
                         }
                     }
@@ -448,6 +467,30 @@ impl<'a> Lexer<'a> {
             }
         }
 
+        // $'...' decoded: emit as SingleQuoted (literal — no re-interpretation).
+        // With a preceding word fragment, the Word goes out first and the
+        // ANSI text is queued for the next next_token call.
+        if let Some(decoded) = ansi_standalone {
+            let a_start = ansi_span_start.unwrap_or(start);
+            let a_end = self.cursor.pos();
+            let ansi_tok = Token::new(
+                TokenKind::SingleQuoted(decoded),
+                shell_ast::Span::new(a_start, a_end, start_ln, start_col),
+            );
+            self.record_heredoc_delimiter(&ansi_tok.kind)?;
+            if s.is_empty() {
+                return Ok(ansi_tok);
+            }
+            // The Word ends where $' began — the queued SingleQuoted starts
+            // exactly there so the parser's adjacency merge joins them.
+            let word_tok = Token::new(
+                TokenKind::Word(s),
+                shell_ast::Span::new(start, a_start, start_ln, start_col),
+            );
+            self.queued.push_back(ansi_tok);
+            self.record_heredoc_delimiter(&word_tok.kind)?;
+            return Ok(word_tok);
+        }
         let span = self.cursor.span_from(start, start_ln, start_col);
         let tok = if self.awaiting_heredoc.is_some() {
             Token::new(TokenKind::Word(s), span)
@@ -545,20 +588,11 @@ impl<'a> Lexer<'a> {
 
         loop {
             if self.cursor.peek().is_none() {
-                return Err(ShellError::lex(
-                    Span::new(
-                        self.cursor.pos(),
-                        self.cursor.pos(),
-                        self.cursor.line,
-                        self.cursor.col,
-                    ),
-                    format!("unterminated heredoc for delimiter '{}'", heredoc.delimiter),
-                ));
+                // bash: EOF before the terminator is a warning, not an error —
+                // the body runs to end of file and lexing continues.
+                break;
             }
 
-            let line_start = self.cursor.pos();
-            let line_ln = self.cursor.line;
-            let line_col = self.cursor.col;
             let mut line = String::new();
             while let Some(c) = self.cursor.peek() {
                 if c == '\n' {
@@ -594,12 +628,7 @@ impl<'a> Lexer<'a> {
                     self.cursor.advance();
                     body.push('\n');
                 }
-                None => {
-                    return Err(ShellError::lex(
-                        Span::new(line_start, self.cursor.pos(), line_ln, line_col),
-                        format!("unterminated heredoc for delimiter '{}'", heredoc.delimiter),
-                    ));
-                }
+                None => break, // EOF: keep the accumulated body (bash warning case)
                 _ => unreachable!(),
             }
         }
@@ -670,6 +699,80 @@ fn read_backtick_body(cursor: &mut Cursor, s: &mut String) {
                 s.push('`');
                 break;
             }
+            Some(c) => s.push(c),
+        }
+    }
+}
+
+/// ANSI-C quoting body: `$'...'` — decode escapes into literal chars.
+fn read_ansi_c_body(cursor: &mut Cursor, s: &mut String) {
+    loop {
+        match cursor.advance() {
+            None | Some('\'') => break,
+            Some('\\') => match cursor.advance() {
+                Some('a') => s.push('\u{07}'),
+                Some('b') => s.push('\u{08}'),
+                Some('e') | Some('E') => s.push('\u{1B}'),
+                Some('f') => s.push('\u{0C}'),
+                Some('n') => s.push('\n'),
+                Some('r') => s.push('\r'),
+                Some('t') => s.push('\t'),
+                Some('v') => s.push('\u{0B}'),
+                Some('\\') => s.push('\\'),
+                Some('\'') => s.push('\''),
+                Some('"') => s.push('"'),
+                Some('?') => s.push('?'),
+                Some(c) if c.is_ascii_digit() => {
+                    // \0NNN octal (also \NNN after the leading digit)
+                    let mut digits = String::new();
+                    digits.push(c);
+                    while digits.len() < 3 {
+                        match cursor.peek() {
+                            Some(d) if d.is_ascii_digit() => {
+                                digits.push(d);
+                                cursor.advance();
+                            }
+                            _ => break,
+                        }
+                    }
+                    let code = u32::from_str_radix(&digits, 8).unwrap_or(0);
+                    if let Some(ch) = char::from_u32(code & 0x1FFFFF) {
+                        s.push(ch);
+                    }
+                }
+                Some('x') => {
+                    let mut digits = String::new();
+                    while digits.len() < 2 {
+                        match cursor.peek() {
+                            Some(d) if d.is_ascii_hexdigit() => {
+                                digits.push(d);
+                                cursor.advance();
+                            }
+                            _ => break,
+                        }
+                    }
+                    let code = u32::from_str_radix(&digits, 16).unwrap_or(0);
+                    if let Some(ch) = char::from_u32(code) {
+                        s.push(ch);
+                    }
+                }
+                // \cX: control char — X & 0x1F (e.g. \cA → 0x01, \c[ → ESC,
+                // \cz → 0x1A; XOR-0x40 breaks lowercase inputs).
+                Some('c') => match cursor.advance() {
+                    Some(c) => {
+                        let code = (c as u32) & 0x1F;
+                        if let Some(ch) = char::from_u32(code) {
+                            s.push(ch);
+                        }
+                    }
+                    None => s.push('\\'),
+                },
+                Some(c) => {
+                    s.push('\\');
+                    s.push(c);
+                }
+                None => s.push('\\'),
+            },
             Some(c) => s.push(c),
         }
     }
