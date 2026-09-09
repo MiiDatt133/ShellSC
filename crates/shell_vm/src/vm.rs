@@ -1329,6 +1329,31 @@ impl Vm {
     fn run_exit_trap(&mut self) {
         if let builtins::trap::TrapDisposition::Command(cmd) = &self.trap_exit {
             let cmd = cmd.clone();
+            self.trap_exit = builtins::trap::TrapDisposition::Default;
+            // If the trap command is a bare function name, invoke it directly
+            // in the current VM so func_table IPs resolve against the correct
+            // bytecode. Compiling "myfn" into a child VM would make its
+            // func_table entry_ips point into the parent's code, not the
+            // child's freshly compiled chunk.
+            if !cmd.contains(|c: char| c.is_whitespace() || c == ';' || c == '|' || c == '&')
+                && self.func_table.contains_key(cmd.as_str())
+            {
+                if let Some(&entry_ip) = self.func_table.get(cmd.as_str()) {
+                    let saved_ip = self.ip;
+                    let saved_fence = self.ip_fence;
+                    // Fence right after current position so FuncReturn breaks out.
+                    self.ip_fence = Some(saved_ip);
+                    self.env.push_frame(&[]);
+                    self.call_stack.push(CallFrame {
+                        return_ip: saved_ip,
+                        saved_redirs: self.pending_redirs.clone(),
+                    });
+                    self.ip = entry_ip as usize;
+                    let _ = self.run();
+                    self.ip_fence = saved_fence;
+                    return;
+                }
+            }
             self.run_trap_command(&cmd);
         }
     }
