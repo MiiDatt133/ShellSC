@@ -1,4 +1,5 @@
 pub mod builtins;
+pub mod entropy;
 pub mod env;
 pub mod exec;
 pub mod frame;

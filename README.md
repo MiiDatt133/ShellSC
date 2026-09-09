@@ -60,7 +60,10 @@ Pipelines, subshells, brace groups, `if/elif/else`, `while/until/for/case`, func
 - Per-build opcode shuffling (Fisher-Yates)
 - Control-flow flattening + opaque predicates
 - Virtualized dispatch obfuscation
-- Self-modifying bytecode (`--smc`): decrypt one instruction at a time
+- Self-modifying bytecode (`--smc`): decrypt one instruction at a time, with three anti-decode layers:
+  - **Chained keystream** — each instruction's keystream derives from the decoded bytes of the previous one, so decryption must replay from instruction 0 in order (no parallel/sliced unpacking)
+  - **Runtime salt** — const-pool strings, heredoc bodies and function names are masked with a per-process entropy value that exists only in the live process, never in the `.sc` file; static decryption with the correct key still yields garbage
+  - **Polymorphic mixers** — the keystream generator itself is picked per build from 4 structurally different algorithm shapes, so two builds of the same script run different decode algorithms
 - Anti-debug (ptrace check), anti-hook (LD_PRELOAD/Frida detection)
 - CRC32 integrity verification
 
@@ -80,5 +83,5 @@ crates/
 
 ---
 
-#ShellSC #RustLang #ShellScripting #Obfuscation #AntiDebugging #ReverseEngineering #CyberSecurity #LinuxDev #AndroidSecurity #Compiler #OpenSource #GitHub
+[#ShellSC](https://github.com/search?q=ShellSC) · [#RustLang](https://github.com/search?q=RustLang) · [#ShellScripting](https://github.com/search?q=ShellScripting) · [#Obfuscation](https://github.com/search?q=Obfuscation) · [#AntiDebugging](https://github.com/search?q=AntiDebugging) · [#ReverseEngineering](https://github.com/search?q=ReverseEngineering) · [#CyberSecurity](https://github.com/search?q=CyberSecurity) · [#LinuxDev](https://github.com/search?q=LinuxDev) · [#AndroidSecurity](https://github.com/search?q=AndroidSecurity) · [#Compiler](https://github.com/search?q=Compiler) · [#OpenSource](https://github.com/search?q=OpenSource) · [#GitHub](https://github.com/search?q=GitHub)
 

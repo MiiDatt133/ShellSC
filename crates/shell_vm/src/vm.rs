@@ -186,7 +186,6 @@ impl Vm {
     /// dispatch loop decrypts one instruction at a time via `smc_instr()`.
     pub fn enable_smc(&mut self, key: [u8; 16]) {
         use crate::smc::{RawInstr, SmcFunc, SmcRedir, SmcStream, SmcTarget};
-
         let instrs: Vec<RawInstr> = std::mem::take(&mut self.bc.instructions)
             .into_iter()
             .map(|i| RawInstr {
@@ -216,7 +215,8 @@ impl Vm {
             })
             .collect();
 
-        self.smc = Some(SmcStream::seal(key, instrs, pool, redirs, funcs));
+        let salt = crate::entropy::runtime_salt();
+        self.smc = Some(SmcStream::seal(key, salt, instrs, pool, redirs, funcs));
     }
 
     /// Current instruction count, from whichever store is live.
@@ -229,8 +229,8 @@ impl Vm {
 
     /// Fetch the instruction at `ip`, decrypting on demand when SMC is on.
     /// Returns None past the end (the run loop treats it as the boundary).
-    fn smc_instr(&self, ip: usize) -> Option<shell_bc::bytecode::Instruction> {
-        let raw = self.smc.as_ref()?.instr_at(ip)?;
+    fn smc_instr(&mut self, ip: usize) -> Option<shell_bc::bytecode::Instruction> {
+        let raw = self.smc.as_mut()?.instr_at(ip)?;
         let op = Opcode::from_u8(raw.op)?;
         Some(shell_bc::bytecode::Instruction {
             op,
@@ -254,6 +254,7 @@ impl Vm {
             Some(stream) => {
                 let parts = stream.unseal()?;
                 let key = parts.key;
+                let salt = parts.salt;
                 let mut plain = Bytecode::new();
                 plain.instructions = parts
                     .instrs
@@ -290,7 +291,7 @@ impl Vm {
                     })
                     .collect();
                 self.bc = plain;
-                Some(key)
+                Some((key, salt))
             }
             None => None,
         };
@@ -385,7 +386,12 @@ impl Vm {
         }
 
         // ── Shift existing absolute targets at/after splice point ──
-        for i in cur.instructions[at..].iter_mut() {
+        // Scan the WHOLE stream, not just the tail: a jump located before
+        // the splice point can still target an address at/after it (e.g. a
+        // loop's conditional jump sits before the loop body's eval call
+        // site, but its exit label lies beyond the splice point). Only
+        // the *target* decides whether it shifts.
+        for i in cur.instructions.iter_mut() {
             match i.op {
                 Opcode::Jmp | Opcode::JmpIfFail | Opcode::JmpIfOk => {
                     if i.operand >= at as u32 {
@@ -430,7 +436,7 @@ impl Vm {
         cur.instructions.extend(tail);
 
         // ── Re-seal or store plaintext ──
-        if let Some(old) = smc_key {
+        if let Some((old, salt)) = smc_key {
             use crate::smc::{RawInstr, SmcFunc, SmcRedir, SmcStream, SmcTarget};
             let instrs: Vec<RawInstr> = cur
                 .instructions
@@ -464,6 +470,7 @@ impl Vm {
                 .collect();
             self.smc = Some(SmcStream::seal(
                 old,
+                salt,
                 instrs,
                 cur.const_pool.strings.clone(),
                 redirs,
@@ -501,7 +508,11 @@ impl Vm {
         let sbc = shell_bc::compile_to_sbc(&chunk);
         let bc = shell_bc::assemble_sbc(&sbc)?;
 
-        let mut child = Vm::new_child(bc, self.env.snapshot(), self.smc.clone());
+        // The child runs freshly compiled plaintext bytecode; it must NOT
+        // inherit the parent's SMC stream — the dispatch loop prefers smc
+        // over bc, so a cloned stream would execute the *parent's* program
+        // from ip 0 and crash.
+        let mut child = Vm::new_child(bc, self.env.snapshot(), None);
         child.func_table = self.func_table.clone();
         child.pending_stdin = stdin_data.map(|d| std::io::Cursor::new(d.to_vec()));
         child.capture_stack.push(vec![]);
