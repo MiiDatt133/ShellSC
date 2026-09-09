@@ -755,7 +755,20 @@ impl Vm {
                     self.glob_deficit = 0;
                     let argv = self.pop_n(n)?;
                     let redirs = self.take_redirs();
-                    if let Err(e) = spawn_background(&argv, redirs) {
+                    // Shell function in background: run it in a detached
+                    // child VM (bash semantics — `fn &` runs the function
+                    // body asynchronously in the shell, not as a new process).
+                    if let Some(&entry_ip) = self.func_table.get(&argv[0]) {
+                        let mut child =
+                            Vm::new_child(self.bc.clone(), self.env.snapshot(), self.smc.clone());
+                        child.func_table = self.func_table.clone();
+                        child.pending_redirs = redirs.specs;
+                        child.env.push_frame(&argv[1..].to_vec());
+                        child.ip = entry_ip as usize;
+                        std::thread::spawn(move || {
+                            let _ = child.run();
+                        });
+                    } else if let Err(e) = spawn_background(&argv, redirs) {
                         self.handle_exec_error(&argv[0], e);
                     }
                     self.status = ExitStatus::OK;
@@ -1695,10 +1708,10 @@ impl Vm {
                         });
                 self.pending_redirs.retain(|r| r.fd != 0);
                 // Explicit heredoc redirect takes priority over piped stdin cursor.
+                // A fresh here-string always replaces the cursor: the previous
+                // read may have left an exhausted one behind.
                 if let Some(data) = redir_stdin_data {
-                    if self.pending_stdin.is_none() {
-                        self.pending_stdin = Some(std::io::Cursor::new(data));
-                    }
+                    self.pending_stdin = Some(std::io::Cursor::new(data));
                     return Ok(builtins::read::run(
                         &names,
                         &mut self.env,
@@ -2272,6 +2285,18 @@ impl Vm {
                             j += 1;
                         }
                         out.push_str(&self.env.expand(&body[start..j]));
+                        i = j;
+                    }
+                    b'$' | b'?' | b'#' | b'*' | b'@' | b'0' => {
+                        out.push_str(&self.env.expand(&body[i + 1..i + 2]));
+                        i += 2;
+                    }
+                    b if b.is_ascii_digit() => {
+                        let mut j = i + 1;
+                        while j < bytes.len() && bytes[j].is_ascii_digit() {
+                            j += 1;
+                        }
+                        out.push_str(&self.env.expand(&body[i + 1..j]));
                         i = j;
                     }
                     _ => {

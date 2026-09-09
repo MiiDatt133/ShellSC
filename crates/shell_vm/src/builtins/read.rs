@@ -9,11 +9,29 @@ pub fn run(
     stdin_file: Option<String>,
     stdin_cursor: Option<&mut Cursor<Vec<u8>>>,
 ) -> BuiltinResult {
-    let (_, var_args) = if args.first().map(|s| s.as_str()) == Some("-r") {
-        (true, &args[1..])
-    } else {
-        (false, &args[..])
-    };
+    let mut read_array = false;
+    let mut rest = args;
+    while let Some(flag) = rest.first() {
+        match flag.as_str() {
+            "-r" => rest = &rest[1..],
+            "-a" => {
+                read_array = true;
+                rest = &rest[1..];
+            }
+            // Combined short flags like -ra
+            f if f.len() > 2
+                && f.starts_with('-')
+                && f[1..].chars().all(|c| c == 'r' || c == 'a') =>
+            {
+                if f.contains('a') {
+                    read_array = true;
+                }
+                rest = &rest[1..];
+            }
+            _ => break,
+        }
+    }
+    let var_args = rest;
 
     let mut line = String::new();
 
@@ -47,6 +65,22 @@ pub fn run(
         }
     }
     if var_args.is_empty() {
+        return BuiltinResult::ok();
+    }
+
+    // `read -a arr`: split the whole line on IFS into array elements.
+    if read_array {
+        let name = var_args[0].clone();
+        let ifs = env.get("IFS").unwrap_or(" \t\n").to_string();
+        let fields: Vec<String> = if ifs.is_empty() {
+            vec![line.clone()]
+        } else {
+            line.split(|c: char| ifs.contains(c))
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        };
+        env.set_array(&name, fields);
         return BuiltinResult::ok();
     }
 

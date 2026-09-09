@@ -52,7 +52,7 @@ chmod +x script.sc && ./script.sc
 
 ## Supported Syntax
 
-Pipelines, subshells, brace groups, `if/elif/else`, `while/until/for/case`, functions, arrays (`arr=(a b)`, `${arr[@]}`, `${#arr[@]}`), command substitution `$(cmd)`, arithmetic `$((expr))`, heredocs, here-strings, glob/brace expansion, parameter expansion (`:-`, `:=`, `:+`, `:?`, `#pat`, `%pat`, `##pat`, `%%pat`, substring), `trap`, `eval`, `exec`, `local`, redirects (`>`, `>>`, `<`, `2>&1`, etc.), background `&`, boolean `&&`/`||`.
+Pipelines, subshells, brace groups, `if/elif/else`, `while/until/for/case`, functions, arrays (`arr=(a b)`, `${arr[@]}`, `${#arr[@]}`, `arr[i]=v`, `arr+=(...)`, `unset arr[i]`, `read -a arr`), command substitution `$(cmd)`, arithmetic `$((expr))`, heredocs, here-strings, glob/brace expansion, parameter expansion (`:-`, `:=`, `:+`, `:?`, `#pat`, `%pat`, `##pat`, `%%pat`, substring), `trap` (string or function name, incl. `trap myfn EXIT`), `eval`, `exec`, `local`, `shift`, redirects (`>`, `>>`, `<`, `2>&1`, etc.), background `&` (external commands and shell functions), boolean `&&`/`||`.
 
 ## Protection (`--protect`)
 
@@ -66,6 +66,7 @@ Pipelines, subshells, brace groups, `if/elif/else`, `while/until/for/case`, func
   - **Polymorphic mixers** — the keystream generator itself is picked per build from 4 structurally different algorithm shapes, so two builds of the same script run different decode algorithms
 - Anti-debug (ptrace check), anti-hook (LD_PRELOAD/Frida detection)
 - CRC32 integrity verification
+- **Key derivation from stub `.text`** — the XOR key is masked with the CRC32 of the stub's own `.text` section and re-derived at runtime from the mapped ELF; patching a single byte inside `.text` (e.g. NOP-ing an anti-debug check) invalidates the key and the binary refuses to run
 
 ## Structure
 

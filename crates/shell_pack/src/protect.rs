@@ -609,7 +609,7 @@ mod tests {
 
     #[test]
     fn open_plain_payload_returns_none() {
-        assert!(open(b"SHBC\x03").unwrap().is_none());
+        assert!(open(b"SHBC\x03", 0).unwrap().is_none());
     }
 
     #[test]
