@@ -22,7 +22,6 @@ pub fn run(
                 read_array = true;
                 rest = &rest[1..];
             }
-            // Combined short flags like -ra
             f if f.len() > 2
                 && f.starts_with('-')
                 && f[1..].chars().all(|c| c == 'r' || c == 'a') =>
@@ -42,30 +41,25 @@ pub fn run(
 
     let mut line = String::new();
 
-    let ok = if let Some(path) = stdin_file {
+    let n_read = if let Some(path) = stdin_file {
         match std::fs::File::open(&path) {
             Ok(f) => {
                 let mut reader = std::io::BufReader::new(f);
-                reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false)
+                reader.read_line(&mut line).unwrap_or(0)
             }
-            Err(_) => false,
+            Err(_) => return BuiltinResult::fail(),
         }
     } else if let Some(cursor) = stdin_cursor.as_deref_mut() {
-        // Read one line from the cursor; position advances automatically.
-        // as_deref_mut reborrows, so stdin_cursor stays usable later.
-        cursor.read_line(&mut line).map(|n| n > 0).unwrap_or(false)
+        cursor.read_line(&mut line).unwrap_or(0)
     } else {
         let stdin = std::io::stdin();
-        stdin
-            .lock()
-            .read_line(&mut line)
-            .map(|n| n > 0)
-            .unwrap_or(false)
+        stdin.lock().read_line(&mut line).unwrap_or(0)
     };
 
-    if !ok {
+    if n_read == 0 {
         return BuiltinResult::fail();
     }
+    let eof_without_newline = !line.ends_with('\n');
     if line.ends_with('\n') {
         line.pop();
         if line.ends_with('\r') {
@@ -73,10 +67,6 @@ pub fn run(
         }
     }
 
-    // Without -r, backslash escapes the next char: \newline is a line
-    // continuation (join lines), other \x keeps x and drops the backslash.
-    // An escaped IFS char is marked with \x01 so field splitting keeps it
-    // glued to the current field (bash: `read a b <<< 'x\ y'` → a="x y").
     const ESC_MARK: char = '\u{1}';
     let mut has_marks = false;
     if !raw_mode {
@@ -86,7 +76,6 @@ pub fn run(
             if c == '\\' {
                 match queue.pop_front() {
                     Some('\n') => {
-                        // Line continuation: read the next input line.
                         let mut extra = String::new();
                         let read_more = match stdin_cursor.as_deref_mut() {
                             Some(cur) => cur.read_line(&mut extra).unwrap_or(0) > 0,
@@ -120,12 +109,13 @@ pub fn run(
     }
 
     if var_args.is_empty() {
+        if eof_without_newline {
+            return BuiltinResult::fail();
+        }
         return BuiltinResult::ok();
     }
 
     let ifs = env.get("IFS").unwrap_or(" \t\n").to_string();
-    // An IFS char preceded by ESC_MARK was escaped with a backslash —
-    // not a separator.
     let is_marked = |bytes: &[u8], i: usize| i > 0 && bytes[i - 1] == ESC_MARK as u8;
     let split_point = |bytes: &[u8], i: usize| -> bool {
         if ifs.is_empty() {
@@ -135,7 +125,6 @@ pub fn run(
         ifs.contains(c) && !is_marked(bytes, i)
     };
 
-    // Split on unescaped IFS chars, then strip ESC_MARK from every field.
     let strip_marks = |s: &str| -> String {
         if has_marks {
             s.chars().filter(|c| *c != ESC_MARK).collect()
@@ -144,7 +133,6 @@ pub fn run(
         }
     };
 
-    // `read -a arr`: split the whole line on IFS into array elements.
     if read_array {
         let name = var_args[0].clone();
         let bytes = line.as_bytes();
@@ -166,13 +154,12 @@ pub fn run(
             fields.push(strip_marks(&cur));
         }
         env.set_array(&name, fields);
+        if eof_without_newline {
+            return BuiltinResult::fail();
+        }
         return BuiltinResult::ok();
     }
 
-    // bash field splitting:
-    // - single var: strip leading/trailing IFS-whitespace, keep the rest raw.
-    // - N vars: the last var takes the raw remainder; earlier vars split on
-    //   unescaped IFS runs. A leading delimiter run yields one empty field.
     let ifs_ws = |c: char| c == ' ' || c == '\t' || c == '\n';
 
     let fields: Vec<String> = if var_args.len() == 1 {
@@ -188,9 +175,6 @@ pub fn run(
         vec![strip_marks(w)]
     } else {
         let take = var_args.len() - 1;
-        // bash tail-field: each var consumes one field, then one delimiter
-        // run — IFS-ws chars plus at most one non-ws IFS char. The final
-        // var takes what remains verbatim.
         let mut rest_raw = line.trim_matches(ifs_ws).to_string();
         let mut head: Vec<String> = Vec::new();
         for _ in 0..take {
@@ -209,8 +193,6 @@ pub fn run(
             match pos {
                 Some(p) => {
                     let f: String = rest_raw[..p].to_string();
-                    // Consume the delimiter run: IFS-ws chars plus at most
-                    // one non-ws IFS char (bash tail-field rule).
                     let mut after = p;
                     let ab = rest_raw.as_bytes();
                     let mut took_nonws = false;
@@ -237,10 +219,6 @@ pub fn run(
                 }
             }
         }
-        // bash leaves no dangling trailing delimiter when it would terminate
-        // a null final field: strip a trailing delim run only when every
-        // delimiter in the remainder is part of that trailing run
-        // (":x:" → b="x", but "x:y:z:" → b="y:z:").
         let rbytes = rest_raw.as_bytes();
         let mut cut = rbytes.len();
         while cut > 0 {
@@ -278,6 +256,9 @@ pub fn run(
     for (i, var) in var_args.iter().enumerate() {
         let val = fields.get(i).map(|s| s.as_str()).unwrap_or("");
         env.set(var.as_str(), val);
+    }
+    if eof_without_newline {
+        return BuiltinResult::fail();
     }
     BuiltinResult::ok()
 }
