@@ -26,6 +26,9 @@ struct LoopCtx {
 pub struct Lowerer {
     chunk: IrChunk,
     loop_stack: Vec<LoopCtx>,
+    /// Redirects desugared from `&>` / `&>>` — emitted right after the
+    /// originating redirect by the lower_redirect caller.
+    extra_redirs: Vec<IrRedir>,
 }
 
 impl Lowerer {
@@ -33,6 +36,7 @@ impl Lowerer {
         Self {
             chunk: IrChunk::new(),
             loop_stack: vec![],
+            extra_redirs: vec![],
         }
     }
 
@@ -94,6 +98,9 @@ impl Lowerer {
                                 if let Some(ir) = self.lower_redirect(redir)? {
                                     self.chunk.push(IrOp::Redirect(ir));
                                 }
+                                for extra in self.extra_redirs.drain(..) {
+                                    self.chunk.push(IrOp::Redirect(extra));
+                                }
                             }
                         }
                         for s in stmts {
@@ -115,6 +122,9 @@ impl Lowerer {
                             for redir in redirects {
                                 if let Some(ir) = self.lower_redirect(redir)? {
                                     self.chunk.push(IrOp::Redirect(ir));
+                                }
+                                for extra in self.extra_redirs.drain(..) {
+                                    self.chunk.push(IrOp::Redirect(extra));
                                 }
                             }
                         }
@@ -142,6 +152,12 @@ impl Lowerer {
         for redir in &cmd.redirects {
             if let Some(ir) = self.lower_redirect(redir)? {
                 self.chunk.push(IrOp::Redirect(ir));
+            }
+            for extra in self.extra_redirs.drain(..) {
+                self.chunk.push(IrOp::Redirect(extra));
+            }
+            for extra in self.extra_redirs.drain(..) {
+                self.chunk.push(IrOp::Redirect(extra));
             }
             // If lower_redirect returned None it already emitted RedirectDyn + word code.
         }
@@ -535,12 +551,53 @@ impl Lowerer {
     }
 
     fn lower_redirect(&mut self, redir: &Redirect) -> Result<Option<IrRedir>, ShellError> {
+        // `&>file` / `&>>file` — desugar into `>file 2>&1` / `>>file 2>&1`:
+        // fd1 to the file, then fd2 duplicating fd1. The second redirect is
+        // queued in extra_redirs for the caller to emit right after this one.
+        if matches!(redir.kind, RedirectKind::Both | RedirectKind::BothAppend) {
+            let base_kind = if redir.kind == RedirectKind::Both {
+                IrRedirKind::Out
+            } else {
+                IrRedirKind::Append
+            };
+            if let RedirectTarget::File(w) = &redir.target {
+                if let Some(lit) = w.as_literal() {
+                    let file = lit.to_string();
+                    self.extra_redirs.push(IrRedir {
+                        kind: IrRedirKind::OutFd,
+                        fd: 2,
+                        target: IrRedirTarget::Fd(1),
+                    });
+                    return Ok(Some(IrRedir {
+                        kind: base_kind,
+                        fd: 1,
+                        target: IrRedirTarget::File(file),
+                    }));
+                }
+                // Dynamic target: evaluate word, RedirectDyn for fd1, then
+                // dup fd2→fd1. RedirectDyn pops its target from the stack, so
+                // lower the word twice.
+                self.lower_word(w)?;
+                self.chunk.push(IrOp::RedirectDyn {
+                    kind: base_kind,
+                    fd: 1,
+                });
+                self.extra_redirs.push(IrRedir {
+                    kind: IrRedirKind::OutFd,
+                    fd: 2,
+                    target: IrRedirTarget::Fd(1),
+                });
+                return Ok(None);
+            }
+        }
         let kind = match redir.kind {
             RedirectKind::Out => IrRedirKind::Out,
             RedirectKind::Append => IrRedirKind::Append,
             RedirectKind::In => IrRedirKind::In,
             RedirectKind::OutFd => IrRedirKind::OutFd,
             RedirectKind::InFd => IrRedirKind::InFd,
+            // Both/BothAppend are desugared and return early above.
+            RedirectKind::Both | RedirectKind::BothAppend => IrRedirKind::Out,
             RedirectKind::HereDoc | RedirectKind::HereDocStrip => {
                 if redir.no_expand {
                     IrRedirKind::HereDocLit
@@ -659,6 +716,9 @@ impl Lowerer {
             if let Some(ir) = self.lower_redirect(redir)? {
                 self.chunk.push(IrOp::Redirect(ir));
             }
+            for extra in self.extra_redirs.drain(..) {
+                self.chunk.push(IrOp::Redirect(extra));
+            }
         }
         let loop_start = self.chunk.here();
         for s in &w.condition {
@@ -695,6 +755,9 @@ impl Lowerer {
         for redir in &f.redirects {
             if let Some(ir) = self.lower_redirect(redir)? {
                 self.chunk.push(IrOp::Redirect(ir));
+            }
+            for extra in self.extra_redirs.drain(..) {
+                self.chunk.push(IrOp::Redirect(extra));
             }
         }
         for item in &f.items {
@@ -774,6 +837,9 @@ impl Lowerer {
             if let Some(ir) = self.lower_redirect(redir)? {
                 self.chunk.push(IrOp::Redirect(ir));
             }
+            for extra in self.extra_redirs.drain(..) {
+                self.chunk.push(IrOp::Redirect(extra));
+            }
         }
         self.chunk.push(IrOp::SubshellBegin);
         for s in stmts {
@@ -792,6 +858,9 @@ impl Lowerer {
         for redir in redirects {
             if let Some(ir) = self.lower_redirect(redir)? {
                 self.chunk.push(IrOp::Redirect(ir));
+            }
+            for extra in self.extra_redirs.drain(..) {
+                self.chunk.push(IrOp::Redirect(extra));
             }
         }
         for s in stmts {

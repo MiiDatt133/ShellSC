@@ -57,6 +57,10 @@ pub enum TokenKind {
     RedirIn,
     /// >&
     RedirOutFd,
+    /// &> — both stdout and stderr
+    RedirBoth,
+    /// &>> — both append
+    RedirBothAppend,
     /// <&
     RedirInFd,
     /// <<
@@ -174,6 +178,8 @@ impl std::fmt::Display for TokenKind {
             TokenKind::RedirIn => write!(f, "<"),
             TokenKind::RedirOutFd => write!(f, ">&"),
             TokenKind::RedirInFd => write!(f, "<&"),
+            TokenKind::RedirBoth => write!(f, "&>"),
+            TokenKind::RedirBothAppend => write!(f, "&>>"),
             TokenKind::HereDoc => write!(f, "<<"),
             TokenKind::HereDocStrip => write!(f, "<<-"),
             TokenKind::HereString => write!(f, "<<<"),

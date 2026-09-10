@@ -291,6 +291,10 @@ pub enum RedirectKind {
     In,
     OutFd,
     InFd,
+    /// `&>` — stdout + stderr to file
+    Both,
+    /// `&>>` — stdout + stderr append to file
+    BothAppend,
     HereDoc,
     HereDocStrip,
     HereString,

@@ -56,7 +56,7 @@ chmod +x script.sc && ./script.sc
 
 ## Supported Syntax
 
-Pipelines, subshells, brace groups, `if/elif/else`, `while/until/for/case`, functions, arrays (`arr=(a b)`, `${arr[@]}`, `${#arr[@]}`, `arr[i]=v`, `arr+=(...)`, `unset arr[i]`, `read -a arr`), command substitution `$(cmd)`, arithmetic `$((expr))`, heredocs, here-strings, glob/brace expansion, ANSI-C quoting `$'\t'` / `$'\x41'`, parameter expansion (`:-`, `:=`, `:+`, `:?`, `#pat`, `%pat`, `##pat`, `%%pat`, substring), `trap` (string or function name, incl. `trap myfn EXIT`), `eval`, `exec`, `local`, `shift`, redirects (`>`, `>>`, `<`, `2>&1`, etc.), background `&` (external commands and shell functions), boolean `&&`/`||`.
+Pipelines, subshells, brace groups, `if/elif/else`, `while/until/for/case`, functions, arrays (`arr=(a b)`, `${arr[@]}`, `${#arr[@]}`, `arr[i]=v`, `arr+=(...)`, `unset arr[i]`, `read -a arr`), command substitution `$(cmd)`, arithmetic `$((expr))`, heredocs, here-strings, glob/brace expansion, ANSI-C quoting `$'\t'` / `$'\x41'`, parameter expansion (`:-`, `:=`, `:+`, `:?`, `#pat`, `%pat`, `##pat`, `%%pat`, substring), tilde expansion (`~`, `~/path`), `trap` (string or function name, incl. `trap myfn EXIT`), `eval`, `exec`, `local`, `shift`, redirects (`>`, `>>`, `<`, `2>&1`, `&>`/`&>>` both-streams, etc.), background `&` (external commands and shell functions), boolean `&&`/`||`.
 
 Not supported: process substitution `<(cmd)`, associative arrays (`declare -A`), coprocesses.
 

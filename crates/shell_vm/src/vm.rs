@@ -970,11 +970,7 @@ impl Vm {
 
                 Opcode::Redirect => {
                     let spec = self.redir_spec(instr.operand)?;
-                    if self.pipeline_expected > 0 {
-                        self.pipeline_pending_redirs.push(spec);
-                    } else {
-                        self.pending_redirs.push(spec);
-                    }
+                    self.adopt_redir(spec);
                 }
 
                 // Dynamic redirect — path is on top of the value stack.
@@ -1003,11 +999,7 @@ impl Vm {
                             kind,
                         }
                     };
-                    if self.pipeline_expected > 0 {
-                        self.pipeline_pending_redirs.push(spec);
-                    } else {
-                        self.pending_redirs.push(spec);
-                    }
+                    self.adopt_redir(spec);
                 }
 
                 Opcode::Jmp => {
@@ -1689,34 +1681,68 @@ impl Vm {
         self.write_to_fd_inner(1, data, &mut Vec::new());
     }
 
+    /// Register a redirect spec. Bash truncates the target file the moment
+    /// the redirect operator is applied (open with O_TRUNC), not on every
+    /// write — later writes in the same statement/function then append.
+    /// So: truncate (Out kind) here, then write append-only in
+    /// write_to_fd_inner. Baseline restores (function-call frames) assign
+    /// pending_redirs directly and never pass here, so they re-truncate
+    /// nothing.
+    fn adopt_redir(&mut self, spec: RedirSpec) {
+        if self.pipeline_expected > 0 {
+            self.pipeline_pending_redirs.push(spec);
+            return;
+        }
+        if let (RedirKind::Out, RedirTargetSpec::File(path)) = (&spec.kind, &spec.target) {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path);
+        }
+        self.pending_redirs.push(spec);
+    }
+
     fn write_to_fd_inner(&mut self, fd: u32, data: &[u8], visited: &mut Vec<u32>) {
         if data.is_empty() || visited.contains(&fd) {
             return;
         }
         visited.push(fd);
 
-        let spec = self
-            .pending_redirs
-            .iter()
-            .rev()
-            .find(|s| s.fd == fd)
-            .cloned()
-            .or_else(|| {
-                self.persistent_redirs
-                    .iter()
-                    .rev()
-                    .find(|s| s.fd == fd)
-                    .cloned()
-            });
-        if let Some(spec) = spec {
-            match &spec.target {
+        // Resolve like bash: apply specs in declaration order; an Fd target
+        // resolves against the mapping built from earlier specs only. The
+        // last spec for a fd wins. This handles swap cycles (`2>&1 1>&2`)
+        // and call-site chains (`f >file 2>&1` + body `echo >&2`).
+        let spec: Option<(RedirKind, RedirTargetSpec)> = {
+            let mut map: HashMap<u32, RedirTargetSpec> = HashMap::new();
+            let mut kinds: HashMap<u32, RedirKind> = HashMap::new();
+            for s in self
+                .pending_redirs
+                .iter()
+                .chain(self.persistent_redirs.iter())
+            {
+                let resolved = match &s.target {
+                    RedirTargetSpec::Fd(n) => {
+                        map.get(n).cloned().unwrap_or_else(|| s.target.clone())
+                    }
+                    _ => s.target.clone(),
+                };
+                kinds.insert(s.fd, s.kind.clone());
+                map.insert(s.fd, resolved);
+            }
+            map.remove(&fd)
+                .map(|t| (kinds.remove(&fd).unwrap_or(RedirKind::Out), t))
+        };
+        if let Some((_, target)) = spec {
+            match &target {
                 RedirTargetSpec::File(path) => {
-                    let is_append = matches!(spec.kind, RedirKind::Append);
+                    // Truncation happened when the redirect was adopted
+                    // (adopt_redir); all writes append so consecutive
+                    // writes from one statement share the file.
                     let res = std::fs::OpenOptions::new()
                         .write(true)
                         .create(true)
-                        .append(is_append)
-                        .truncate(!is_append)
+                        .append(true)
                         .open(path);
                     if let Ok(mut f) = res {
                         let _ = f.write_all(data);
@@ -1724,8 +1750,17 @@ impl Vm {
                     return;
                 }
                 RedirTargetSpec::Fd(target_fd) => {
-                    self.write_to_fd_inner(*target_fd, data, visited);
-                    return;
+                    if *target_fd == fd {
+                        // Resolved back to itself (e.g. `echo x >&2` after
+                        // `2>&1 >/dev/null` resolves 1 to the original fd1):
+                        // bash semantics — the fd copies its current self,
+                        // i.e. no effective redirect. Fall through to the
+                        // default stream instead of hitting the visited-guard.
+                        visited.pop();
+                    } else {
+                        self.write_to_fd_inner(*target_fd, data, visited);
+                        return;
+                    }
                 }
                 RedirTargetSpec::HereDoc(_) => {
                     return;

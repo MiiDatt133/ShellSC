@@ -686,6 +686,8 @@ impl Parser {
             | TokenKind::RedirIn
             | TokenKind::RedirOutFd
             | TokenKind::RedirInFd
+            | TokenKind::RedirBoth
+            | TokenKind::RedirBothAppend
             | TokenKind::HereDoc
             | TokenKind::HereDocStrip
             | TokenKind::HereString => true,
@@ -726,6 +728,8 @@ impl Parser {
             TokenKind::RedirIn => RedirectKind::In,
             TokenKind::RedirOutFd => RedirectKind::OutFd,
             TokenKind::RedirInFd => RedirectKind::InFd,
+            TokenKind::RedirBoth => RedirectKind::Both,
+            TokenKind::RedirBothAppend => RedirectKind::BothAppend,
             TokenKind::HereDoc => RedirectKind::HereDoc,
             TokenKind::HereDocStrip => RedirectKind::HereDocStrip,
             TokenKind::HereString => RedirectKind::HereString,
@@ -838,6 +842,22 @@ impl Parser {
         let mut chars = s.char_indices().peekable();
         let mut lit = String::new();
         let mut may_glob = false; // true when unquoted * ? [ found
+
+        // Tilde expansion: a leading unquoted `~` (followed by `/` or
+        // end-of-word) becomes $HOME. ~user lookups are not supported.
+        if s.starts_with('~') {
+            let rest = &s[1..];
+            if rest.is_empty() || rest.starts_with('/') {
+                parts.push(WordPart::Var("HOME".to_string()));
+                if rest.is_empty() {
+                    return Ok((parts, may_glob));
+                }
+                // Continue expanding the remainder after `~/`.
+                let (rest_parts, rest_glob) = self.expand_parts(rest, span)?;
+                parts.extend(rest_parts);
+                return Ok((parts, may_glob || rest_glob));
+            }
+        }
 
         while let Some((_, c)) = chars.next() {
             match c {

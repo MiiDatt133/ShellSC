@@ -122,6 +122,15 @@ impl<'a> Lexer<'a> {
                 self.cursor.advance();
                 if self.cursor.eat('&') {
                     Ok(self.make(TokenKind::And, start, start_ln, start_col))
+                } else if self.cursor.peek() == Some('>') {
+                    // `&>` / `&>>` — redirect both stdout and stderr.
+                    self.cursor.advance();
+                    if self.cursor.peek() == Some('>') {
+                        self.cursor.advance();
+                        Ok(self.make(TokenKind::RedirBothAppend, start, start_ln, start_col))
+                    } else {
+                        Ok(self.make(TokenKind::RedirBoth, start, start_ln, start_col))
+                    }
                 } else {
                     Ok(self.make(TokenKind::Ampersand, start, start_ln, start_col))
                 }
