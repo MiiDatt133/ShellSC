@@ -4,6 +4,7 @@ use crate::status::ExitStatus;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrapSignal {
     Exit,
+    Err,
     Int,
     Term,
 }
@@ -12,6 +13,7 @@ impl TrapSignal {
     pub fn from_name(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
             "EXIT" | "0" => Some(Self::Exit),
+            "ERR" => Some(Self::Err),
             "INT" | "SIGINT" | "2" => Some(Self::Int),
             "TERM" | "SIGTERM" | "15" => Some(Self::Term),
             _ => None,

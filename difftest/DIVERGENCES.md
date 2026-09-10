@@ -332,3 +332,12 @@ Scripts f1–f48 (batch tests plus minimal isolations). Clean PASS: f5, f8, f10,
 ## Round f scripts
 
 f1–f48 kept as .sh regression tests. .sc and output .txt files removed after recording.
+
+## g-series difftest (2026-09-10)
+
+| Test | Issue | Status |
+|------|-------|--------|
+| g4 | Recursive function with cmdsub `$(fib $(($1-1)))` returns wrong value (sc=4, bash=21) | Known bug - nested cmdsub in recursive fn |
+| g10 | `exec 3>&1` + `echo >&3` + `exec 3>&-` — output lost on fd 3 | Known bug - exec fd redirect write |
+| g15 | `(exit 42) &` runs inline instead of background — lowering ignores `&` for subshells | Known limitation - subshell bg not implemented |
+| g16 | `printf 'hello\\' | read -r x` — bash: x="" rc=1 (EOF no newline), sc: x="hello\" rc=0 | Known bug - read from pipe EOF handling |

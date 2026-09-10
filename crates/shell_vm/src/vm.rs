@@ -73,6 +73,7 @@ pub struct Vm {
     /// When set, run() stops when ip reaches this value (used for inline subshell stages).
     ip_fence: Option<usize>,
     trap_exit: builtins::trap::TrapDisposition,
+    trap_err: builtins::trap::TrapDisposition,
     trap_int: builtins::trap::TrapDisposition,
     trap_term: builtins::trap::TrapDisposition,
     /// File handles opened by `exec N< file` / `exec N> file` — live for the
@@ -140,6 +141,7 @@ impl Vm {
             bg_chain: None,
             ip_fence: None,
             trap_exit: builtins::trap::TrapDisposition::Default,
+            trap_err: builtins::trap::TrapDisposition::Default,
             trap_int: builtins::trap::TrapDisposition::Default,
             trap_term: builtins::trap::TrapDisposition::Default,
             exec_fds: HashMap::new(),
@@ -1439,6 +1441,33 @@ impl Vm {
         }
     }
 
+    fn run_err_trap(&mut self) {
+        if let builtins::trap::TrapDisposition::Command(cmd) = &self.trap_err {
+            let cmd = cmd.clone();
+            self.trap_err = builtins::trap::TrapDisposition::Default;
+            if !cmd.contains(|c: char| c.is_whitespace() || c == ';' || c == '|' || c == '&')
+                && self.func_table.contains_key(cmd.as_str())
+            {
+                if let Some(&entry_ip) = self.func_table.get(cmd.as_str()) {
+                    let saved_ip = self.ip;
+                    let saved_fence = self.ip_fence;
+                    self.ip_fence = Some(saved_ip);
+                    self.env.push_frame(&[]);
+                    self.call_stack.push(CallFrame {
+                        return_ip: saved_ip,
+                        saved_redirs: self.pending_redirs.clone(),
+                        base_redirs: self.pending_redirs.clone(),
+                    });
+                    self.ip = entry_ip as usize;
+                    let _ = self.run();
+                    self.ip_fence = saved_fence;
+                    return;
+                }
+            }
+            self.run_trap_command(&cmd);
+        }
+    }
+
     fn run_trap_command(&mut self, cmd: &str) {
         // Compile the trap body and run it in a child VM sharing this
         // environment snapshot — `sh -c` would lose arrays and shell-scoped
@@ -2110,6 +2139,8 @@ impl Vm {
                 for h in self.bg_handles.drain(..) {
                     let _ = h.join();
                 }
+                // bash: wait without args always returns 0.
+                self.update_status(ExitStatus::OK);
                 BuiltinResult::ok()
             }
 
@@ -2119,6 +2150,7 @@ impl Vm {
                 for action in actions {
                     match action.signal {
                         builtins::trap::TrapSignal::Exit => self.trap_exit = action.disposition,
+                        builtins::trap::TrapSignal::Err => self.trap_err = action.disposition,
                         builtins::trap::TrapSignal::Int => self.trap_int = action.disposition,
                         builtins::trap::TrapSignal::Term => self.trap_term = action.disposition,
                     }
@@ -2146,6 +2178,9 @@ impl Vm {
     fn update_status(&mut self, st: ExitStatus) {
         self.status = st;
         self.env.set("?", st.to_string());
+        if st.0 != 0 {
+            self.run_err_trap();
+        }
     }
 
     // ── Misc helpers ──────────────────────────────────────────────────────────
