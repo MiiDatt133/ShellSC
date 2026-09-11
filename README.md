@@ -41,6 +41,9 @@ chmod +x script.sc && ./script.sc
 
 # With protection (encrypted bytecode, anti-debug, SMC)
 ./target/release/shellsc build --protect --smc script.sh
+
+# With all protections at once (protect + smc + self-debug)
+./target/release/shellsc build --all script.sh
 ```
 
 ## Commands
@@ -62,6 +65,8 @@ Not supported: process substitution `<(cmd)`, associative arrays (`declare -A`),
 
 ## Protection (`--protect`)
 
+Available on `build` and `pack`. Use `--all` to enable every protection at once (`--protect --smc --self-debug`). A protected `.sc` prints `Protected by ShellSC` as its first line when run.
+
 - XOR encryption of bytecode with random per-build key
 - Per-build opcode shuffling (Fisher-Yates)
 - Control-flow flattening + opaque predicates
@@ -71,6 +76,7 @@ Not supported: process substitution `<(cmd)`, associative arrays (`declare -A`),
   - **Runtime salt** — const-pool strings, heredoc bodies and function names are masked with a per-process entropy value that exists only in the live process, never in the `.sc` file; static decryption with the correct key still yields garbage
   - **Polymorphic mixers** — the keystream generator itself is picked per build from 4 structurally different algorithm shapes, so two builds of the same script run different decode algorithms
 - Anti-debug (ptrace check), anti-hook (LD_PRELOAD/Frida detection)
+- Self-debug (`--self-debug`): fork a child that ptrace-attaches the parent, occupying the single tracer slot so no external debugger can attach
 - CRC32 integrity verification
 - **Key derivation from stub `.text`** — the XOR key is masked with the CRC32 of the stub's own `.text` section and re-derived at runtime from the mapped ELF; patching a single byte inside `.text` (e.g. NOP-ing an anti-debug check) invalidates the key and the binary refuses to run
 
