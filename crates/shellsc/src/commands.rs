@@ -51,9 +51,10 @@ fn cmd_pack(m: &ArgMatches) -> Result<()> {
     let sbc_text = std::fs::read_to_string(&input)
         .with_context(|| format!("reading '{}'", input.display()))?;
 
-    let protect = m.get_flag("protect");
-    let smc = m.get_flag("smc");
-    let selfdebug = m.get_flag("self-debug");
+    let all = m.get_flag("all");
+    let protect = all || m.get_flag("protect");
+    let smc = all || m.get_flag("smc");
+    let selfdebug = all || m.get_flag("self-debug");
 
     let bc = sbc_to_bytecode(&sbc_text)?;
     let bc_bytes = bc.to_bytes();
@@ -87,9 +88,10 @@ fn cmd_build(m: &ArgMatches) -> Result<()> {
     let emit_all = m.get_flag("emit_all");
     let emit_sbc = m.get_flag("emit_sbc") || emit_all;
     let emit_bc = m.get_flag("emit_bc") || emit_all;
-    let protect = m.get_flag("protect");
-    let smc = m.get_flag("smc");
-    let selfdebug = m.get_flag("self-debug");
+    let all = m.get_flag("all");
+    let protect = all || m.get_flag("protect");
+    let smc = all || m.get_flag("smc");
+    let selfdebug = all || m.get_flag("self-debug");
 
     let src = read_source(&input)?;
     let (sbc_text, bc_bytes, sc_bytes) = full_pipeline(&src, protect, smc, selfdebug)?;

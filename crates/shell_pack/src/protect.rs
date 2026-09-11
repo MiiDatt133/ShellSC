@@ -405,12 +405,14 @@ pub fn open(payload: &[u8], text_hash: u32) -> Result<Option<Vec<u8>>, ShellErro
 
     if header.flags & FLAG_OPMAP != 0 && header.opmap_seed != 0 {
         let inv = opcode_inverse(header.opmap_seed);
-        revert_opmap(&mut body, &inv)?;
+        revert_opmap(&mut body, &inv).map_err(|_| {
+            ShellError::IoError("binary tampered: refuse to run modified executable".into())
+        })?;
     }
 
     if crc32(&body) != header.crc32 {
         return Err(ShellError::IoError(
-            "bytecode integrity check failed".into(),
+            "binary tampered: refuse to run modified executable".into(),
         ));
     }
     if body.len() != header.orig_len as usize {
@@ -640,6 +642,6 @@ mod tests {
         let last = tampered.len() - 1;
         tampered[last] ^= 0xFF;
         let err = open(&tampered, 0).err().unwrap().to_string();
-        assert!(err.contains("integrity") || err.contains("opcode"), "{err}");
+        assert!(err.contains("tampered"), "{err}");
     }
 }

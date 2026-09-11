@@ -58,6 +58,12 @@ pub fn build_cli() -> Command {
                         .action(ArgAction::SetTrue)
                         .requires("protect")
                         .help("Fork a child that ptrace-attaches the parent, blocking external debuggers"),
+                )
+                .arg(
+                    Arg::new("all")
+                        .long("all")
+                        .action(ArgAction::SetTrue)
+                        .help("Enable all protections: --protect --smc --self-debug"),
                 ),
         )
         .subcommand(
@@ -113,6 +119,12 @@ pub fn build_cli() -> Command {
                         .action(ArgAction::SetTrue)
                         .requires("protect")
                         .help("Fork a child that ptrace-attaches the parent, blocking external debuggers"),
+                )
+                .arg(
+                    Arg::new("all")
+                        .long("all")
+                        .action(ArgAction::SetTrue)
+                        .help("Enable all protections: --protect --smc --self-debug"),
                 ),
         )
         .subcommand(

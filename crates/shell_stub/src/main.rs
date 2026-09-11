@@ -60,6 +60,15 @@ fn run() -> Result<()> {
             let mut header_opt: Option<shell_pack::ProtectHeader> = None;
             let is_protected = shell_pack::is_protected(payload);
 
+            // Derive the key from clean ELF bytes BEFORE anti-dump hardening
+            // zeroes the ELF magic — otherwise text_crc_from_elf cannot parse
+            // and the .text integrity check silently degrades to crc(0).
+            let text_crc = if is_protected {
+                shell_pack::protect::text_crc_from_elf(&bytes).unwrap_or(0)
+            } else {
+                0
+            };
+
             // Harden BEFORE decryption so no plaintext window exists
             // between open() and harden — closes crash-dump exposure.
             if is_protected {
@@ -67,6 +76,7 @@ fn run() -> Result<()> {
             }
 
             let mut bc_bytes: Vec<u8> = if is_protected {
+                eprintln!("Protected by ShellSC");
                 let header = shell_pack::ProtectHeader::from_bytes(payload)
                     .map_err(|e| anyhow::anyhow!("protect header: {}", e))?;
                 if header.flags & shell_pack::protect::FLAG_ANTIDEBUG != 0 {
@@ -78,7 +88,6 @@ fn run() -> Result<()> {
                 if header.flags & shell_pack::protect::FLAG_SELFDEBUG != 0 {
                     selfdebug_check()?;
                 }
-                let text_crc = shell_pack::protect::text_crc_from_elf(&bytes).unwrap_or(0);
                 let bc = shell_pack::open(payload, text_crc)
                     .map_err(|e| anyhow::anyhow!("unsealing bytecode: {}", e))?
                     .context("protected payload too short")?;
@@ -232,7 +241,9 @@ fn selfdebug_check() -> Result<()> {
 /// disable dumpable flag, and zero ELF headers so tools like readelf/objdump
 /// cannot parse the in-memory image. Best-effort, non-fatal on failure.
 fn anti_dump_harden(elf_bytes: &[u8]) {
-    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0); }
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+    }
 
     let elf = match Elf::parse(elf_bytes) {
         Ok(e) => e,
@@ -265,11 +276,15 @@ fn anti_dump_harden(elf_bytes: &[u8]) {
 
     let ptr = elf_bytes.as_ptr() as *mut u8;
     if elf_bytes.len() >= 4 {
-        unsafe { std::ptr::write_bytes(ptr, 0, 4); }
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, 4);
+        }
     }
     if elf_bytes.len() >= 48 && elf.header.e_shoff != 0 {
         let shoff_ptr = unsafe { ptr.add(40) };
-        unsafe { std::ptr::write_bytes(shoff_ptr, 0, 8); }
+        unsafe {
+            std::ptr::write_bytes(shoff_ptr, 0, 8);
+        }
     }
 }
 
@@ -280,4 +295,3 @@ fn exe_path() -> Result<PathBuf> {
             .context("resolving /proc/self/exe")
     })
 }
-
