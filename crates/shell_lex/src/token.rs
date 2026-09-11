@@ -11,13 +11,6 @@ impl Token {
         Self { kind, span }
     }
 
-    pub fn is_word(&self) -> bool {
-        matches!(
-            &self.kind,
-            TokenKind::Word(_) | TokenKind::SingleQuoted(_) | TokenKind::DoubleQuoted(_)
-        )
-    }
-
     pub fn is_newline_or_semi(&self) -> bool {
         matches!(self.kind, TokenKind::Newline | TokenKind::Semi)
     }
