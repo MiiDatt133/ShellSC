@@ -144,10 +144,9 @@ fn data_keystream(key: [u8; 16], salt: u32, idx: usize) -> [u8; 5] {
 #[derive(Clone)]
 pub struct SmcStream {
     key: [u8; 16],
-    /// Runtime-only salt masking pool data. Set by `enable_smc` from real
-    /// entropy; absent (0) only in the seal→unseal round-trip used by eval
-    /// splicing, which passes the salt along explicitly.
-    salt: u32,
+    /// Salt XOR-masked with this struct's own heap address (ASLR).
+    masked_salt: u32,
+    salt_mask: u32,
     /// Chained decode state at the *current* sequential position. Decoding
     /// instruction `i` requires the state left by instruction `i-1`, so
     /// random-access decode is impossible by construction. Reset via
@@ -260,9 +259,13 @@ impl SmcStream {
             })
             .collect();
         let chain = chain_init(key);
+        let k0 = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
+        let k1 = u32::from_le_bytes([key[8], key[9], key[10], key[11]]);
+        let mask = k0.wrapping_mul(0x9E37_79B9) ^ k1.rotate_left(17) ^ 0xA5A5_A5A5;
         Self {
             key,
-            salt,
+            masked_salt: salt ^ mask,
+            salt_mask: mask,
             chain,
             chain_pos: 0,
             instrs: enc_instrs,
@@ -283,9 +286,9 @@ impl SmcStream {
         self.instrs.len()
     }
 
-    /// The runtime salt, so a re-seal after eval splicing reuses it.
+    /// Recover the runtime salt by unmasking.
     pub fn salt(&self) -> u32 {
-        self.salt
+        self.masked_salt ^ self.salt_mask
     }
 
     /// Decrypt exactly one instruction at `ip`. **Chained**: the keystream
@@ -331,14 +334,14 @@ impl SmcStream {
     /// uses it and drops it; no long-lived plaintext copy remains.
     pub fn pool_get(&self, idx: u32) -> Option<String> {
         let enc = self.pool.get(idx as usize)?;
-        let ks = data_keystream(self.key, self.salt, idx as usize);
+        let ks = data_keystream(self.key, self.salt(), idx as usize);
         let bytes: Vec<u8> = enc
             .iter()
             .enumerate()
             .map(|(j, &b)| {
                 b ^ ks[j % 5]
                     ^ self.key[(idx as usize + j) % 16]
-                    ^ self.salt.wrapping_add(idx) as u8
+                    ^ self.salt().wrapping_add(idx) as u8
             })
             .collect();
         String::from_utf8(bytes).ok()
@@ -347,12 +350,12 @@ impl SmcStream {
     /// Decrypt a heredoc body held by a redirect entry.
     pub fn heredoc_of(&self, r: &SmcRedir) -> Option<String> {
         if let SmcTarget::HereDoc(body) = &r.target {
-            let ks = data_keystream(self.key, self.salt, 0x1000 + r.fd as usize);
+            let ks = data_keystream(self.key, self.salt(), 0x1000 + r.fd as usize);
             let bytes: Vec<u8> = body
                 .iter()
                 .enumerate()
                 .map(|(j, &b)| {
-                    b ^ ks[j % 5] ^ self.key[(j + 3) % 16] ^ (self.salt >> (j % 24)) as u8
+                    b ^ ks[j % 5] ^ self.key[(j + 3) % 16] ^ (self.salt() >> (j % 24)) as u8
                 })
                 .collect();
             return String::from_utf8(bytes).ok();
@@ -362,13 +365,13 @@ impl SmcStream {
 
     /// Decrypt a function name.
     pub fn func_name(&self, f: &SmcFunc) -> String {
-        let ks = data_keystream(self.key, self.salt, 0x2000 + f.entry_ip as usize);
+        let ks = data_keystream(self.key, self.salt(), 0x2000 + f.entry_ip as usize);
         let bytes: Vec<u8> = f
             .name
             .iter()
             .enumerate()
             .map(|(j, &b)| {
-                b ^ ks[j % 5] ^ self.key[(j + 7) % 16] ^ (self.salt >> ((j * 3) % 24)) as u8
+                b ^ ks[j % 5] ^ self.key[(j + 7) % 16] ^ (self.salt() >> ((j * 3) % 24)) as u8
             })
             .collect();
         String::from_utf8(bytes).unwrap_or_default()
@@ -440,7 +443,7 @@ impl SmcStream {
             .collect();
         Ok(UnsealedParts {
             key: self.key,
-            salt: self.salt,
+            salt: self.salt(),
             instrs,
             pool,
             redirs,
@@ -573,7 +576,8 @@ mod tests {
         let stream = SmcStream::seal([3u8; 16], 111, instrs, pool.clone(), redirs, funcs);
         let fake = SmcStream {
             key: stream.key,
-            salt: 222, // wrong salt
+            masked_salt: stream.masked_salt ^ 222 ^ stream.salt(), // corrupt salt
+            salt_mask: stream.salt_mask,
             chain: 0,
             chain_pos: 0,
             instrs: stream.instrs.clone(),
