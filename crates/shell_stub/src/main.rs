@@ -80,10 +80,14 @@ fn run() -> Result<()> {
                 payload.to_vec()
             };
 
+            // Anti-dump hardening when protected: mlock .text, disable core
+            // dumps, zero ELF headers so memory forensics tools fail.
+            if header_opt.is_some() {
+                anti_dump_harden(&bytes);
+            }
+
             let bc = Bytecode::from_bytes(&bc_bytes)
                 .map_err(|e| anyhow::anyhow!("deserializing bytecode: {}", e))?;
-            // Scrub the transient plaintext buffer before running — with
-            // SMC on, the program should only exist encrypted past this point.
             bc_bytes.iter_mut().for_each(|b| *b ^= 0xFF);
             drop(bc_bytes);
             let mut vm = Vm::new(bc);
@@ -94,8 +98,6 @@ fn run() -> Result<()> {
                     vm.enable_cff(h.cff_seed, h.opaque_param1, h.opaque_param2);
                 }
                 if h.flags & shell_pack::protect::FLAG_SMC != 0 {
-                    // Re-key the in-memory program: seal it back under a
-                    // derived key so the deserialized plaintext never lingers.
                     let mut k = h.key;
                     for (i, b) in k.iter_mut().enumerate() {
                         *b = b.wrapping_add(h.crc32 as u8).rotate_left(2)
@@ -117,8 +119,7 @@ fn run() -> Result<()> {
     bail!("no .shellsc section found — is this a valid .sc file?")
 }
 
-/// Refuse to run under a tracer (ptrace-based debugger / strace). Reads
-/// TracerPid from /proc/self/status: 0 means untraced.
+/// Refuse to run under a tracer (ptrace-based debugger / strace).
 fn antidebug_check() -> Result<()> {
     let status = fs::read_to_string("/proc/self/status").context("reading /proc/self/status")?;
     for line in status.lines() {
@@ -133,8 +134,7 @@ fn antidebug_check() -> Result<()> {
     bail!("TracerPid not found in /proc/self/status")
 }
 
-/// Refuse to run with library hooks in play: an injected LD_PRELOAD or a
-/// known hooking framework mapped into the process.
+/// Refuse to run with library hooks in play.
 fn antihook_check() -> Result<()> {
     if let Ok(v) = std::env::var("LD_PRELOAD") {
         if !v.trim().is_empty() {
@@ -153,11 +153,7 @@ fn antihook_check() -> Result<()> {
 }
 
 /// Fork a child that ptrace-attaches the parent, occupying the single
-/// tracer slot so no external debugger can attach. The child acts as a
-/// minimal tracer: it resumes the parent on every stop, forwards real
-/// signals so the parent's handlers still fire, and exits as soon as
-/// the parent does — otherwise the parent's exit is never reaped and
-/// the invoking shell hangs on wait().
+/// tracer slot so no external debugger can attach.
 fn selfdebug_check() -> Result<()> {
     unsafe {
         let pid = libc::fork();
@@ -165,7 +161,6 @@ fn selfdebug_check() -> Result<()> {
             bail!("self-debug: fork failed");
         }
         if pid == 0 {
-            // Child: attach to parent, then trace until it exits.
             let ppid = libc::getppid();
             if libc::ptrace(
                 libc::PTRACE_ATTACH,
@@ -179,16 +174,13 @@ fn selfdebug_check() -> Result<()> {
             let mut status: libc::c_int = 0;
             loop {
                 if libc::waitpid(ppid, &mut status, 0) <= 0 {
-                    break; // parent gone (reaped elsewhere / ECHILD)
+                    break;
                 }
                 if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
-                    break; // parent exited — die with it
+                    break;
                 }
                 if libc::WIFSTOPPED(status) {
                     let sig = libc::WSTOPSIG(status);
-                    // SIGSTOP (from ATTACH) and SIGTRAP are internal
-                    // stops: resume without injecting. Real signals are
-                    // forwarded so SIGINT/SIGTERM handlers still run.
                     let deliver = if sig == libc::SIGSTOP || sig == libc::SIGTRAP {
                         0
                     } else {
@@ -204,9 +196,53 @@ fn selfdebug_check() -> Result<()> {
             }
             libc::_exit(0);
         }
-        // Parent: the child attaches and resumes us; just continue.
     }
     Ok(())
+}
+
+/// Anti-dump hardening: lock .text in memory, exclude from core dumps,
+/// disable dumpable flag, and zero ELF headers so tools like readelf/objdump
+/// cannot parse the in-memory image. Best-effort, non-fatal on failure.
+fn anti_dump_harden(elf_bytes: &[u8]) {
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0); }
+
+    let elf = match Elf::parse(elf_bytes) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for sh in &elf.section_headers {
+        if elf.shdr_strtab.get_at(sh.sh_name) == Some(".text") {
+            let start = sh.sh_offset as usize;
+            let len = sh.sh_size as usize;
+            if start + len > elf_bytes.len() || len == 0 {
+                break;
+            }
+            let ptr = elf_bytes.as_ptr() as *mut libc::c_void;
+            let text_ptr = unsafe { ptr.add(start) };
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+            if page_size == 0 {
+                break;
+            }
+            let aligned = (text_ptr as usize) & !(page_size - 1);
+            let aligned_len = len + (text_ptr as usize - aligned);
+            let aligned_ptr = aligned as *mut libc::c_void;
+            unsafe {
+                libc::mlock(aligned_ptr, aligned_len);
+                #[cfg(target_os = "linux")]
+                libc::madvise(aligned_ptr, aligned_len, libc::MADV_DONTDUMP);
+            }
+            break;
+        }
+    }
+
+    let ptr = elf_bytes.as_ptr() as *mut u8;
+    if elf_bytes.len() >= 4 {
+        unsafe { std::ptr::write_bytes(ptr, 0, 4); }
+    }
+    if elf_bytes.len() >= 48 && elf.header.e_shoff != 0 {
+        let shoff_ptr = unsafe { ptr.add(40) };
+        unsafe { std::ptr::write_bytes(shoff_ptr, 0, 8); }
+    }
 }
 
 fn exe_path() -> Result<PathBuf> {
@@ -216,3 +252,4 @@ fn exe_path() -> Result<PathBuf> {
             .context("resolving /proc/self/exe")
     })
 }
+
