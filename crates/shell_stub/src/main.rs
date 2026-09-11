@@ -58,7 +58,15 @@ fn run() -> Result<()> {
                 .context(".shellsc section out of bounds")?;
 
             let mut header_opt: Option<shell_pack::ProtectHeader> = None;
-            let mut bc_bytes: Vec<u8> = if shell_pack::is_protected(payload) {
+            let is_protected = shell_pack::is_protected(payload);
+
+            // Harden BEFORE decryption so no plaintext window exists
+            // between open() and harden — closes crash-dump exposure.
+            if is_protected {
+                anti_dump_harden(&bytes);
+            }
+
+            let mut bc_bytes: Vec<u8> = if is_protected {
                 let header = shell_pack::ProtectHeader::from_bytes(payload)
                     .map_err(|e| anyhow::anyhow!("protect header: {}", e))?;
                 if header.flags & shell_pack::protect::FLAG_ANTIDEBUG != 0 {
@@ -80,16 +88,11 @@ fn run() -> Result<()> {
                 payload.to_vec()
             };
 
-            // Anti-dump hardening when protected: mlock .text, disable core
-            // dumps, zero ELF headers so memory forensics tools fail.
-            if header_opt.is_some() {
-                anti_dump_harden(&bytes);
-            }
-
             let bc = Bytecode::from_bytes(&bc_bytes)
                 .map_err(|e| anyhow::anyhow!("deserializing bytecode: {}", e))?;
             bc_bytes.iter_mut().for_each(|b| *b ^= 0xFF);
             drop(bc_bytes);
+
             let mut vm = Vm::new(bc);
             if let Some(h) = &header_opt {
                 if h.flags & shell_pack::protect::FLAG_CFF != 0
@@ -104,6 +107,7 @@ fn run() -> Result<()> {
                             ^ (h.cff_seed as u8).wrapping_mul(31 ^ i as u8);
                     }
                     vm.enable_smc(k);
+                    k.iter_mut().for_each(|b| *b = 0);
                 }
             }
             if let Some(arg0) = std::env::args().next() {
@@ -153,14 +157,21 @@ fn antihook_check() -> Result<()> {
 }
 
 /// Fork a child that ptrace-attaches the parent, occupying the single
-/// tracer slot so no external debugger can attach.
+/// tracer slot so no external debugger can attach. Uses a pipe to block
+/// the parent until the child has completed PTRACE_ATTACH, closing the
+/// race window where an external debugger could slip in.
 fn selfdebug_check() -> Result<()> {
     unsafe {
+        let mut pipefd = [0i32; 2];
+        if libc::pipe(pipefd.as_mut_ptr()) < 0 {
+            bail!("self-debug: pipe failed");
+        }
         let pid = libc::fork();
         if pid < 0 {
             bail!("self-debug: fork failed");
         }
         if pid == 0 {
+            libc::close(pipefd[0]);
             let ppid = libc::getppid();
             if libc::ptrace(
                 libc::PTRACE_ATTACH,
@@ -172,6 +183,19 @@ fn selfdebug_check() -> Result<()> {
                 libc::_exit(1);
             }
             let mut status: libc::c_int = 0;
+            if libc::waitpid(ppid, &mut status, 0) > 0 && libc::WIFSTOPPED(status) {
+                libc::ptrace(
+                    libc::PTRACE_CONT,
+                    ppid,
+                    std::ptr::null_mut::<libc::c_void>(),
+                    std::ptr::null_mut::<libc::c_void>(),
+                );
+                let buf = [1u8; 1];
+                let _ = libc::write(pipefd[1], buf.as_ptr() as *const libc::c_void, 1);
+            } else {
+                libc::_exit(1);
+            }
+            libc::close(pipefd[1]);
             loop {
                 if libc::waitpid(ppid, &mut status, 0) <= 0 {
                     break;
@@ -196,6 +220,10 @@ fn selfdebug_check() -> Result<()> {
             }
             libc::_exit(0);
         }
+        libc::close(pipefd[1]);
+        let mut buf = [0u8; 1];
+        let _ = libc::read(pipefd[0], buf.as_mut_ptr() as *mut libc::c_void, 1);
+        libc::close(pipefd[0]);
     }
     Ok(())
 }

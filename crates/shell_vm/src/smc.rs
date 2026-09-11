@@ -384,8 +384,7 @@ impl SmcStream {
         &self.funcs
     }
 
-    /// The sealing key — needed to re-seal after a plaintext splice (eval).
-    pub fn key(&self) -> [u8; 16] {
+    fn key(&self) -> [u8; 16] {
         self.key
     }
 
