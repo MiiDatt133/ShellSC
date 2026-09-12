@@ -51,6 +51,14 @@ impl SbcEmitter {
                 out.push_str("CmdSubEnd\n");
             }
 
+            IrOp::ProcSubBegin => {
+                out.push_str("ProcSubBegin\n");
+            }
+
+            IrOp::ProcSubEnd => {
+                out.push_str("ProcSubEnd\n");
+            }
+
             IrOp::ExecExternal(n) => {
                 out.push_str(&format!("ExecExternal {}\n", n));
             }

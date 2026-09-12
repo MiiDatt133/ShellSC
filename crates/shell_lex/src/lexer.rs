@@ -181,6 +181,10 @@ impl<'a> Lexer<'a> {
                     }
                 } else if self.cursor.eat('&') {
                     Ok(self.make(TokenKind::RedirInFd, start, start_ln, start_col))
+                } else if self.cursor.peek() == Some('(') {
+                    // Process substitution: `<(cmd)`. Plain `<` still wins for
+                    // redirects because `(` only follows immediately.
+                    Ok(self.make(TokenKind::ProcSubIn, start, start_ln, start_col))
                 } else {
                     Ok(self.make(TokenKind::RedirIn, start, start_ln, start_col))
                 }

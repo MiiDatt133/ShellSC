@@ -79,6 +79,16 @@ pub struct Vm {
     /// File handles opened by `exec N< file` / `exec N> file` — live for the
     /// rest of the script, unlike per-command pending_redirs.
     exec_fds: HashMap<u32, std::fs::File>,
+    /// fd>2 dup targets made persistent by `exec 3>&1` — fd maps to another
+    /// fd. Resolved at write time (write_to_fd_inner) and cloned into
+    /// RedirSet for child processes.
+    exec_fd_dups: HashMap<u32, u32>,
+    /// Temp files backing `<(cmd)` process substitutions; removed on exit.
+    procsub_temps: Vec<std::path::PathBuf>,
+    procsub_counter: u64,
+    /// Enclosing-command redirects stashed while a procsub body runs, so the
+    /// body executes with a clean redirect set (subshell semantics).
+    procsub_redir_stash: Vec<Vec<RedirSpec>>,
     /// fd 0/1/2 redirections made persistent by `exec > file` etc. Checked
     /// by write_to_fd_inner after per-command pending_redirs.
     persistent_redirs: Vec<RedirSpec>,
@@ -145,6 +155,10 @@ impl Vm {
             trap_int: builtins::trap::TrapDisposition::Default,
             trap_term: builtins::trap::TrapDisposition::Default,
             exec_fds: HashMap::new(),
+            exec_fd_dups: HashMap::new(),
+            procsub_temps: vec![],
+            procsub_counter: 0,
+            procsub_redir_stash: vec![],
             persistent_redirs: vec![],
             exec_terminated: false,
             for_exit_status: None,
@@ -728,6 +742,38 @@ impl Vm {
                     self.stack.push_str(s);
                 }
 
+                Opcode::ProcSubBegin => {
+                    // The body runs in its own subshell: the enclosing
+                    // command's redirects must NOT leak into it (bash runs the
+                    // substitution asynchronously). Stash and restore them.
+                    self.procsub_redir_stash
+                        .push(std::mem::take(&mut self.pending_redirs));
+                    self.capture_stack.push(vec![]);
+                }
+                Opcode::ProcSubEnd => {
+                    // Process substitution: dump the captured output to a temp
+                    // file (raw bytes — the reader strips/consumes as it sees
+                    // fit) and push the path as the word value.
+                    if let Some(redirs) = self.procsub_redir_stash.pop() {
+                        self.pending_redirs = redirs;
+                    }
+                    let buf = self.capture_stack.pop().unwrap_or_default();
+                    self.procsub_counter += 1;
+                    let path = std::env::temp_dir().join(format!(
+                        "shellsc-ps-{}-{}",
+                        std::process::id(),
+                        self.procsub_counter
+                    ));
+                    if std::fs::write(&path, &buf).is_err() {
+                        // Unwritable temp dir: fall back to /dev/null — the
+                        // reader gets an empty stream instead of a bad path.
+                        self.stack.push_str("/dev/null".to_string());
+                    } else {
+                        self.procsub_temps.push(path.clone());
+                        self.stack.push_str(path.to_string_lossy().into_owned());
+                    }
+                }
+
                 Opcode::ExecExternal => {
                     let raw_n = instr.operand as usize;
                     let n = (raw_n + self.glob_surplus).saturating_sub(self.glob_deficit);
@@ -1037,6 +1083,9 @@ impl Vm {
                 }
                 Opcode::Exit => {
                     self.run_exit_trap();
+                    for p in self.procsub_temps.drain(..) {
+                        let _ = std::fs::remove_file(p);
+                    }
                     return Ok(self.status);
                 }
 
@@ -1750,7 +1799,52 @@ impl Vm {
                     return;
                 }
                 RedirTargetSpec::Fd(target_fd) => {
-                    if *target_fd == fd {
+                    // Follow `exec N>&M` dups immediately: dupping to a fd
+                    // that was already visited here means the ORIGINAL fd's
+                    // default stream is the real destination (e.g. `>&3` with
+                    // `exec 3>&1` resolves 1→3→1) — write there directly
+                    // instead of letting the visited-guard eat the data.
+                    let mut dst = *target_fd;
+                    let mut hops = 0;
+                    while dst > 2 && hops < 8 {
+                        match self.exec_fd_dups.get(&dst) {
+                            Some(&t) if t != dst => {
+                                dst = t;
+                                hops += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if visited.contains(&dst) && dst != fd {
+                        // The chain loops back to a fd this write already
+                        // passed through: that fd's current resolution was
+                        // already computed (it resolved to something else or
+                        // fell through to its default stream). Write to the
+                        // default stream of the ORIGINAL target unless the
+                        // original fd (fd) already owns this slot.
+                        match dst {
+                            1 => {
+                                if let Some(frame) = self.capture_stack.last_mut() {
+                                    frame.extend_from_slice(data);
+                                } else {
+                                    let _ = std::io::stdout().write_all(data);
+                                    let _ = std::io::stdout().flush();
+                                }
+                            }
+                            2 => {
+                                let _ = std::io::stderr().write_all(data);
+                                let _ = std::io::stderr().flush();
+                            }
+                            _ => {
+                                let _ = self.exec_fds.get_mut(&dst).map(|f| {
+                                    let _ = f.write_all(data);
+                                    let _ = f.flush();
+                                });
+                            }
+                        }
+                        return;
+                    }
+                    if dst == fd {
                         // Resolved back to itself (e.g. `echo x >&2` after
                         // `2>&1 >/dev/null` resolves 1 to the original fd1):
                         // bash semantics — the fd copies its current self,
@@ -1758,7 +1852,7 @@ impl Vm {
                         // default stream instead of hitting the visited-guard.
                         visited.pop();
                     } else {
-                        self.write_to_fd_inner(*target_fd, data, visited);
+                        self.write_to_fd_inner(dst, data, visited);
                         return;
                     }
                 }
@@ -1768,8 +1862,15 @@ impl Vm {
             }
         }
 
-        // `exec N> file` — fd opened persistently; write straight to the File.
+        // `exec 3>&1` — fd>2 dup chain: resolve through exec_fd_dups before
+        // the File-handle path (visited already guards cycles).
         if fd > 2 {
+            if let Some(target) = self.exec_fd_dups.get(&fd).copied() {
+                if target != fd {
+                    self.write_to_fd_inner(target, data, visited);
+                    return;
+                }
+            }
             if let Some(file) = self.exec_fds.get_mut(&fd) {
                 let _ = file.write_all(data);
                 let _ = file.flush();
@@ -1986,36 +2087,44 @@ impl Vm {
                 // Validate/open fd>2 redirects now; keep fd 0/1/2 specs.
                 let mut status = ExitStatus::OK;
                 for spec in self.pending_redirs.iter() {
+                    if spec.fd <= 2 {
+                        continue;
+                    }
                     if let RedirTargetSpec::File(path) = &spec.target {
-                        if spec.fd > 2 {
-                            let file = match &spec.kind {
-                                RedirKind::In => std::fs::File::open(path),
-                                RedirKind::Out => std::fs::OpenOptions::new()
-                                    .write(true)
-                                    .create(true)
-                                    .truncate(true)
-                                    .open(path),
-                                RedirKind::Append => std::fs::OpenOptions::new()
-                                    .write(true)
-                                    .create(true)
-                                    .append(true)
-                                    .open(path),
-                                _ => Ok(std::fs::File::open(path).unwrap_or_else(|_| {
-                                    std::fs::File::create(path).expect("exec redir create")
-                                })),
-                            };
-                            match file {
-                                Ok(f) => {
-                                    self.exec_fds.insert(spec.fd, f);
-                                }
-                                Err(e) => {
-                                    // bash reports the open failure and keeps
-                                    // going; the fd stays unusable.
-                                    let _ = writeln!(std::io::stderr(), "exec: {}: {}", path, e);
-                                    status = ExitStatus::from_code(1);
-                                }
+                        let file = match &spec.kind {
+                            RedirKind::In => std::fs::File::open(path),
+                            RedirKind::Out => std::fs::OpenOptions::new()
+                                .write(true)
+                                .create(true)
+                                .truncate(true)
+                                .open(path),
+                            RedirKind::Append => std::fs::OpenOptions::new()
+                                .write(true)
+                                .create(true)
+                                .append(true)
+                                .open(path),
+                            _ => Ok(std::fs::File::open(path).unwrap_or_else(|_| {
+                                std::fs::File::create(path).expect("exec redir create")
+                            })),
+                        };
+                        match file {
+                            Ok(f) => {
+                                self.exec_fds.insert(spec.fd, f);
+                                self.exec_fd_dups.remove(&spec.fd);
+                            }
+                            Err(e) => {
+                                // bash reports the open failure and keeps
+                                // going; the fd stays unusable.
+                                let _ = writeln!(std::io::stderr(), "exec: {}: {}", path, e);
+                                status = ExitStatus::from_code(1);
                             }
                         }
+                    } else if let RedirTargetSpec::Fd(n) = &spec.target {
+                        // `exec 3>&1` — persist the dup for this fd; a later
+                        // File redirect of the same fd overrides it (and vice
+                        // versa), so remove whichever earlier mapping exists.
+                        self.exec_fd_dups.insert(spec.fd, *n);
+                        self.exec_fds.remove(&spec.fd);
                     }
                 }
                 if !args.is_empty() {
@@ -2332,7 +2441,11 @@ impl Vm {
                 exec_files.insert(*fd, c);
             }
         }
-        RedirSet { specs, exec_files }
+        RedirSet {
+            specs,
+            exec_files,
+            exec_dups: self.exec_fd_dups.clone(),
+        }
     }
 
     fn redir_spec(&self, idx: u32) -> Result<RedirSpec, ShellError> {

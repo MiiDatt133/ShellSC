@@ -314,12 +314,13 @@ Scripts f1–f48 (batch tests plus minimal isolations). Clean PASS: f5, f8, f10,
 
 - Diagnosis: crates/shell_vm/src/vm.rs expand_heredoc_body — brace param-expansion forms (${...}) not implemented in heredoc expander; only bare $1-style.
 
-### D-F-17 (f18, f32): <(...) process substitution in redirect — parse error
+### D-F-17 (f18, f32): <(...) process substitution in redirect — RESOLVED (2026-09-12)
 
     read b < <(echo second)
 
-- bash: b=second ; sc: Error: unexpected token '<' at 3:10 — build fails
-- Diagnosis: crates/shell_parse/src/parser.rs — process substitution unsupported in redirect position. Pre-existing gap surfaced by stdin-cursor tests. Rest of f18 (here-string cursor chains) passes when procsub line removed.
+- Was: bash: b=second ; sc: Error: unexpected token '<' at 3:10 — build fails
+- Fix: full `<(cmd)` support (read mode) — lexer `ProcSubIn` token, `WordPart::ProcSub` AST, `ProcSubBegin/End` IR ops + opcodes (0x2C/0x2D), VM capture-to-tempfile (no trailing-newline strip, unlike cmdsub; redirects of enclosing command stashed so they don't leak into the body; temp files cleaned on Exit). Works in command args (`diff <(a) <(b)`), redirect targets (`read x < <(cmd)`), and assignments (`p=<(cmd)`).
+- Verified: f18, f32, ps2/ps3 (diff procsub, read from procsub) byte-match bash. Write-mode `>(cmd)` still unsupported.
 
 ### Verified OK (no divergence)
 
@@ -338,6 +339,6 @@ f1–f48 kept as .sh regression tests. .sc and output .txt files removed after r
 | Test | Issue | Status |
 |------|-------|--------|
 | g4 | Recursive function with cmdsub `$(fib $(($1-1)))` returns wrong value (sc=4, bash=21) | Known bug - nested cmdsub in recursive fn |
-| g10 | `exec 3>&1` + `echo >&3` + `exec 3>&-` — output lost on fd 3 | Known bug - exec fd redirect write |
-| g15 | `(exit 42) &` runs inline instead of background — lowering ignores `&` for subshells | Known limitation - subshell bg not implemented |
-| g16 | `printf 'hello\\' | read -r x` — bash: x="" rc=1 (EOF no newline), sc: x="hello\" rc=0 | Known bug - read from pipe EOF handling |
+| g10 | `exec 3>&1` + `echo >&3` + `exec 3>&-` — output lost on fd 3 | RESOLVED (2026-09-12) — exec persists fd>2 Fd-dups in `exec_fd_dups`; `>&N` write follows dup chain (incl. chains `3>&1 4>&3`, mix `3>file 4>&3`) |
+| g15 | `(exit 42) &` runs inline instead of background — lowering ignores `&` for subshells | Known limitation - subshell bg not implemented. Also Termux bash `wait` quirk: bash prints rc=0 where sc reports real 42 (sc more POSIX-correct) |
+| g16 | `printf 'hello\\' | read -r x` — bash: x="" rc=1 (EOF no newline), sc: x="hello\" rc=0 | Known bug - read from pipe EOF handling. Note: suite diff 2026-09-12 verified pre-existing (identical on pre-change binary) |

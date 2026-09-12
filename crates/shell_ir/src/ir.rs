@@ -45,6 +45,12 @@ pub enum IrOp {
     CmdSubBegin,
     CmdSubEnd,
 
+    /// Process substitution `<(cmd)`: like CmdSubBegin/End but the captured
+    /// output is written to a temp file and the pushed value is its path
+    /// (no trailing-newline strip — the reader consumes raw bytes).
+    ProcSubBegin,
+    ProcSubEnd,
+
     ExecExternal(usize),
     ExecExternalBg(usize),
 

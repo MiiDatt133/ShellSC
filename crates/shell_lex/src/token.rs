@@ -56,6 +56,9 @@ pub enum TokenKind {
     RedirBothAppend,
     /// <&
     RedirInFd,
+    /// <( — process substitution (read mode). The body tokens follow and the
+    /// parser stops at the matching `)`.
+    ProcSubIn,
     /// <<
     HereDoc,
     /// <<-
@@ -171,6 +174,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::RedirIn => write!(f, "<"),
             TokenKind::RedirOutFd => write!(f, ">&"),
             TokenKind::RedirInFd => write!(f, "<&"),
+            TokenKind::ProcSubIn => write!(f, "<("),
             TokenKind::RedirBoth => write!(f, "&>"),
             TokenKind::RedirBothAppend => write!(f, "&>>"),
             TokenKind::HereDoc => write!(f, "<<"),

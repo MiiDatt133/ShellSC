@@ -617,7 +617,7 @@ impl Parser {
                         word.parts.extend(next.parts);
                     }
                     if argv.is_empty() {
-                        if let Some(a) = try_parse_assignment(&word) {
+                        if let Some(mut a) = try_parse_assignment(&word) {
                             // `arr=(` — the assignment word ends empty and the
                             // next token opens the array element list.
                             let empty = a.value.is_empty() && a.index.is_none();
@@ -625,6 +625,25 @@ impl Parser {
                                 let a = self.parse_array_literal(a, word.span)?;
                                 assigns.push(a);
                                 continue;
+                            }
+                            // `p=<(cmd)` / `p=x<(cmd)` — the process
+                            // substitution is part of the value (adjacent, no
+                            // whitespace). Fold it in instead of leaving it to
+                            // become a stray command word.
+                            if matches!(self.stream.peek_kind(), TokenKind::ProcSubIn) {
+                                let adjacent = self
+                                    .stream
+                                    .prev_token()
+                                    .map(|t| t.span.end)
+                                    .map(|prev_end| self.stream.peek().span.start == prev_end)
+                                    .unwrap_or(false);
+                                if adjacent && a.index.is_none() && !a.is_array {
+                                    let ps = self.parse_procsub_word()?;
+                                    a.value.extend(ps.parts);
+                                    a.span = a.span.merge(ps.span);
+                                    assigns.push(a);
+                                    continue;
+                                }
                             }
                             assigns.push(a);
                             continue;
@@ -645,6 +664,10 @@ impl Parser {
                             }
                         }
                     }
+                    argv.push(word);
+                }
+                TokenKind::ProcSubIn => {
+                    let word = self.parse_procsub_word()?;
                     argv.push(word);
                 }
                 TokenKind::LBrace => match self.try_brace_expand_in_command(&mut argv)? {
@@ -819,6 +842,7 @@ impl Parser {
                     may_glob: false,
                 })
             }
+            TokenKind::ProcSubIn => self.parse_procsub_word(),
             ref kind if kind.as_keyword_str().is_some() => {
                 let kw = kind.as_keyword_str().unwrap();
                 self.stream.advance();
@@ -833,6 +857,24 @@ impl Parser {
                 self.stream.current_span(),
             )),
         }
+    }
+
+    /// `<(cmd)` — consume the marker and the opening `(`, parse the body
+    /// statements up to the closing `)`, and return them wrapped as a
+    /// single-part word. Bash treats the parens purely as delimiters — the
+    /// body is NOT a subshell at this level.
+    fn parse_procsub_word(&mut self) -> Result<Word, ShellError> {
+        let start = self.stream.current_span();
+        self.stream.advance(); // ProcSubIn
+        self.stream.expect(&TokenKind::LParen)?;
+        let stmts = self.parse_compound_list_until(&[TokenKind::RParen])?;
+        self.stream.expect(&TokenKind::RParen)?;
+        let span = start.merge(self.stream.current_span());
+        Ok(Word {
+            parts: vec![WordPart::ProcSub(stmts)],
+            span,
+            may_glob: false,
+        })
     }
 
     // ── Word expansion ─────────────────────────────────────────────────────────

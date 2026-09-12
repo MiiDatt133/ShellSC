@@ -216,6 +216,7 @@ impl std::fmt::Display for Word {
                 WordPart::Literal(s) => write!(f, "{}", s)?,
                 WordPart::Var(v) => write!(f, "${}", v)?,
                 WordPart::CmdSub(_) => write!(f, "$(…)")?,
+                WordPart::ProcSub(_) => write!(f, "<(…)")?,
                 WordPart::ArithSub(_) => write!(f, "$((…))")?,
                 WordPart::VarExpand(e) => write!(f, "${{{}}}", e.var)?,
             }
@@ -229,6 +230,9 @@ pub enum WordPart {
     Literal(String),
     Var(String),
     CmdSub(Vec<Stmt>),
+    /// Process substitution `<(cmd)` — the word expands to a path the
+    /// reader can open (a temp file holding the subshell's output).
+    ProcSub(Vec<Stmt>),
     /// Raw arithmetic expression template, e.g. `"$x + 1 * $y"`.
     /// Variable references are expanded at runtime before evaluation.
     ArithSub(String),

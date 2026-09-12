@@ -29,6 +29,9 @@ pub struct RedirSet {
     /// so child processes can use them directly (the fds are never dup2'd
     /// into this process, so /proc/self/fd/N would not work).
     pub exec_files: HashMap<u32, std::fs::File>,
+    /// fd>2 dup targets from `exec 3>&1` — a child writing fd 3 must reach
+    /// whatever fd the dup points at (File handle or default stream).
+    pub exec_dups: HashMap<u32, u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +52,7 @@ impl Clone for RedirSet {
         Self {
             specs: self.specs.clone(),
             exec_files,
+            exec_dups: self.exec_dups.clone(),
         }
     }
 }
@@ -70,6 +74,7 @@ impl RedirSet {
         Self {
             specs,
             exec_files: HashMap::new(),
+            exec_dups: HashMap::new(),
         }
     }
 
@@ -122,6 +127,7 @@ impl RedirSet {
             RedirSet {
                 specs: other_specs,
                 exec_files: RedirSet::clone_exec_files(&self.exec_files),
+                exec_dups: self.exec_dups.clone(),
             },
         ))
     }
@@ -210,6 +216,17 @@ impl RedirSet {
     /// handle (cloned) — those fds are never dup2'd into this process, so
     /// /proc/self/fd/N would not exist. Falls back to /proc/self/fd/N.
     fn stdio_from_fd(&self, n: u32, write: bool) -> Option<Stdio> {
+        // Follow `exec 3>&1`-style dups first: fd 3 itself is never open in
+        // this process, only its target is.
+        let mut n = n;
+        let mut hops = 0;
+        while let Some(t) = self.exec_dups.get(&n) {
+            if *t == n || hops > 8 {
+                break;
+            }
+            n = *t;
+            hops += 1;
+        }
         if let Some(f) = self.exec_files.get(&n) {
             if let Ok(clone) = f.try_clone() {
                 return Some(Stdio::from(clone));

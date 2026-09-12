@@ -438,6 +438,19 @@ impl Lowerer {
                     self.chunk.push(IrOp::CmdSubEnd);
                     count += 1;
                 }
+                WordPart::ProcSub(stmts) => {
+                    if !lit_buf.is_empty() {
+                        self.chunk
+                            .push(IrOp::PushConst(std::mem::take(&mut lit_buf)));
+                        count += 1;
+                    }
+                    self.chunk.push(IrOp::ProcSubBegin);
+                    for s in stmts {
+                        self.lower_stmt(s)?;
+                    }
+                    self.chunk.push(IrOp::ProcSubEnd);
+                    count += 1;
+                }
                 WordPart::ArithSub(expr) => {
                     // Flush pending literal first.
                     if !lit_buf.is_empty() {

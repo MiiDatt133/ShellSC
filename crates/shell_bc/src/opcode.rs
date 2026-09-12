@@ -61,6 +61,11 @@ pub enum Opcode {
     /// `arr[i]=v`: pop value then index off the value stack.
     /// Operand = const pool idx of the array name.
     ArraySetIndex,
+    /// Process substitution `<(cmd)` begin — capture stdout like CmdSubBegin
+    /// but the result becomes a temp-file path (no newline strip).
+    ProcSubBegin,
+    /// Process substitution end — write capture to temp file, push its path.
+    ProcSubEnd,
 }
 
 impl Opcode {
@@ -109,6 +114,8 @@ impl Opcode {
             Opcode::PushArgs => 0x28,
             Opcode::ArrayAssign => 0x29,
             Opcode::ArraySetIndex => 0x2A,
+            Opcode::ProcSubBegin => 0x2C,
+            Opcode::ProcSubEnd => 0x2D,
             Opcode::Exit => 0xFF,
         }
     }
@@ -158,6 +165,8 @@ impl Opcode {
             0x29 => Some(Opcode::ArrayAssign),
             0x2A => Some(Opcode::ArraySetIndex),
             0x2B => Some(Opcode::CaseMatchDyn),
+            0x2C => Some(Opcode::ProcSubBegin),
+            0x2D => Some(Opcode::ProcSubEnd),
             0xFF => Some(Opcode::Exit),
             _ => None,
         }
@@ -186,6 +195,8 @@ impl Opcode {
                 | Opcode::RedirSave
                 | Opcode::RedirRestore
                 | Opcode::PushArgs
+                | Opcode::ProcSubBegin
+                | Opcode::ProcSubEnd
         )
     }
 }

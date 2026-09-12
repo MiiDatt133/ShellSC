@@ -67,6 +67,8 @@ impl Assembler {
 
             "CmdSubBegin" => self.push_bare(Opcode::CmdSubBegin),
             "CmdSubEnd" => self.push_bare(Opcode::CmdSubEnd),
+            "ProcSubBegin" => self.push_bare(Opcode::ProcSubBegin),
+            "ProcSubEnd" => self.push_bare(Opcode::ProcSubEnd),
 
             "ExecExternal" => {
                 let n = self.req_uint(instr, 0)?;
