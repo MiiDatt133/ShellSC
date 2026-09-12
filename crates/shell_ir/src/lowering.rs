@@ -156,9 +156,6 @@ impl Lowerer {
             for extra in self.extra_redirs.drain(..) {
                 self.chunk.push(IrOp::Redirect(extra));
             }
-            for extra in self.extra_redirs.drain(..) {
-                self.chunk.push(IrOp::Redirect(extra));
-            }
             // If lower_redirect returned None it already emitted RedirectDyn + word code.
         }
         for assign in &cmd.assigns {

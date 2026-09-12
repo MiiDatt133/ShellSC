@@ -57,11 +57,13 @@ pub fn instruction_offsets(data: &[u8]) -> Result<Vec<usize>, ShellError> {
         }
     }
 
-    let func_count = r.read_u32()? as usize;
-    for _ in 0..func_count {
-        let len = r.read_u32()? as usize;
-        r.read_bytes(len)?;
-        r.read_u32()?; // entry_ip
+    if version >= 0x02 {
+        let func_count = r.read_u32()? as usize;
+        for _ in 0..func_count {
+            let len = r.read_u32()? as usize;
+            r.read_bytes(len)?;
+            r.read_u32()?; // entry_ip
+        }
     }
 
     let instr_count = r.read_u32()? as usize;

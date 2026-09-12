@@ -108,9 +108,12 @@ fn format_printf_into(out: &mut String, fmt: &str, vals: &[String], val_idx: usi
                             local_idx += 1;
                             used += 1;
                             let s = match prec {
-                                Some(p) => &s[..s.len().min(p)],
-                                None => s,
+                                // Byte-index slice panics on multibyte UTF-8;
+                                // truncate on char boundaries instead.
+                                Some(p) => s.chars().take(p).collect::<String>(),
+                                None => s.to_string(),
                             };
+                            let s = s.as_str();
                             if width > s.len() {
                                 let pad = " ".repeat(width - s.len());
                                 if left {
@@ -338,53 +341,96 @@ fn format_printf_into(out: &mut String, fmt: &str, vals: &[String], val_idx: usi
 }
 
 fn expand_backslash_escapes(s: &str) -> String {
+    // Walk by bytes but copy non-escape runs verbatim — `as char` on a
+    // continuation byte mangled multibyte UTF-8 into garbage chars.
     let mut out = String::new();
     let bytes = s.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
         if bytes[i] == b'\\' {
             i += 1;
-            if i >= bytes.len() {
-                out.push('\\');
-                break;
-            }
-            match bytes[i] {
-                b'n' => out.push('\n'),
-                b't' => out.push('\t'),
-                b'r' => out.push('\r'),
-                b'\\' => out.push('\\'),
-                b'a' => out.push('\u{07}'),
-                b'b' => out.push('\u{08}'),
-                b'f' => out.push('\u{0C}'),
-                b'v' => out.push('\u{0B}'),
-                b'0' => {
-                    let mut octal = String::new();
+            match bytes.get(i) {
+                None => {
+                    out.push('\\');
+                    break;
+                }
+                Some(b'n') => out.push('\n'),
+                Some(b't') => out.push('\t'),
+                Some(b'r') => out.push('\r'),
+                Some(b'\\') => out.push('\\'),
+                Some(b'a') => out.push('\u{07}'),
+                Some(b'b') => out.push('\u{08}'),
+                Some(b'f') => out.push('\u{0C}'),
+                Some(b'v') => out.push('\u{0B}'),
+                Some(b'0') => {
+                    let mut octal = 0u32;
                     let mut j = i + 1;
-                    for _ in 0..3 {
-                        if j < bytes.len() && bytes[j].is_ascii_digit() && bytes[j] < b'8' {
-                            octal.push(bytes[j] as char);
-                            j += 1;
-                        } else {
-                            break;
-                        }
+                    let mut digits = 0;
+                    while digits < 3 && j < bytes.len() && (b'0'..=b'7').contains(&bytes[j]) {
+                        octal = octal * 8 + (bytes[j] - b'0') as u32;
+                        j += 1;
+                        digits += 1;
                     }
-                    i = j - 1;
-                    if octal.is_empty() {
+                    if digits == 0 {
                         out.push('\0');
                     } else {
-                        let val = u32::from_str_radix(&octal, 8).unwrap_or(0).min(255);
-                        out.push(val as u8 as char);
+                        out.push(octal as u8 as char);
+                        i = j - 1;
                     }
                 }
-                other => {
+                Some(&other) => {
                     out.push('\\');
-                    out.push(other as char);
+                    // One UTF-8 char may span several bytes: copy the run raw.
+                    let start = i;
+                    let mut end = i + 1;
+                    while end < bytes.len() && (bytes[end] & 0xC0) == 0x80 {
+                        end += 1;
+                    }
+                    out.push_str(std::str::from_utf8(&bytes[start..end]).unwrap_or("?"));
+                    i = end - 1;
                 }
             }
         } else {
-            out.push(bytes[i] as char);
+            let start = i;
+            let mut end = i + 1;
+            while end < bytes.len() && (bytes[end] & 0xC0) == 0x80 {
+                end += 1;
+            }
+            out.push_str(std::str::from_utf8(&bytes[start..end]).unwrap_or("?"));
+            i = end - 1;
         }
         i += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn precision_s_multibyte_no_panic() {
+        // `%.2s` on "日本語" used to byte-slice mid-char and panic.
+        let r = run(&["%.2s".to_string(), "日本語".to_string()]);
+        assert_eq!(String::from_utf8_lossy(&r.out), "日本");
+    }
+
+    #[test]
+    fn percent_b_keeps_utf8() {
+        // %b copies the arg through escape expansion — UTF-8 must survive.
+        let r = run(&["%b".to_string(), "héllo\\n".to_string()]);
+        assert_eq!(String::from_utf8_lossy(&r.out), "héllo\n");
+    }
+
+    #[test]
+    fn percent_b_octal_escape() {
+        let r = run(&["%b".to_string(), "a\\0101".to_string()]);
+        assert_eq!(String::from_utf8_lossy(&r.out), "aA");
+    }
+
+    #[test]
+    fn format_reuse_consumes_all_args() {
+        let r = run(&["[%s]".to_string(), "a".to_string(), "b".to_string()]);
+        assert_eq!(String::from_utf8_lossy(&r.out), "[a][b]");
+    }
 }

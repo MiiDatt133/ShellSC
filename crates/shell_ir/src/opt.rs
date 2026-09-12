@@ -232,10 +232,6 @@ fn drop_jmp_to_next(ops: &mut [Option<IrOp>]) {
             continue;
         }
         let next_target = i + 2;
-        // Redirect jumps that pointed at the removed op (or chains through
-        // it — its own target, already chased to a real op, may still be a
-        // fall-through jump removed earlier in this loop, so follow until
-        // the slot is not a live Jmp).
         for slot in ops.iter_mut() {
             if let Some(op) = slot {
                 let hit = match op {
