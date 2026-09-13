@@ -28,6 +28,7 @@ pub fn build_variant_stub(ws_root: &Path, seed: u32) -> Result<PathBuf, ShellErr
         .arg("--release")
         .arg("-p")
         .arg("shell_stub")
+        .args(target_arg())
         .current_dir(ws_root)
         .status()
         .map_err(|e| ShellError::IoError(format!("spawn cargo: {}", e)))?;
@@ -37,7 +38,10 @@ pub fn build_variant_stub(ws_root: &Path, seed: u32) -> Result<PathBuf, ShellErr
         )));
     }
 
-    let stub = target_dir.join("release/shell_stub");
+    let stub = match target_arg() {
+        Some(t) => target_dir.join(t).join("release/shell_stub"),
+        None => target_dir.join("release/shell_stub"),
+    };
     if !stub.exists() {
         return Err(ShellError::IoError(format!(
             "variant stub not found at {}",
@@ -45,6 +49,20 @@ pub fn build_variant_stub(ws_root: &Path, seed: u32) -> Result<PathBuf, ShellErr
         )));
     }
     Ok(stub)
+}
+
+/// `--target` for the variant build so a cross-compiled shellsc rebuilds
+/// its stub variant for its own arch instead of the compiler host's.
+/// SHELLSC_VARIANT_TARGET is set by release packaging (and users who
+/// relocated a prebuilt shellsc); unset means host build — no flag.
+fn target_arg() -> Option<String> {
+    let t = std::env::var_os("SHELLSC_VARIANT_TARGET")?;
+    let t = t.to_string_lossy().to_string();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
 }
 
 /// A fresh variant seed from the same entropy source as the protect key.

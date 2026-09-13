@@ -50,12 +50,22 @@ pub fn full_pipeline(
         opts.selfdebug = selfdebug;
         // Per-build stub variant: rebuild the stub with fresh guard
         // constants so its machine code differs on every protected build.
-        let seed = shell_pack::variant_seed();
-        let ws_root = shell_pack::workspace_root().map_err(map_shell_err)?;
-        eprintln!("protect: building stub variant {seed} (first build is slow)…");
-        let stub = shell_pack::build_variant_stub(&ws_root, seed).map_err(map_shell_err)?;
+        // A prebuilt shellsc has no workspace on the user's machine —
+        // fall back to the bundled stub (still fully sealed, minus the
+        // per-build variant entropy).
+        let variant_stub = match shell_pack::workspace_root() {
+            Ok(ws_root) => {
+                let seed = shell_pack::variant_seed();
+                eprintln!("protect: building stub variant {seed} (first build is slow)…");
+                Some(shell_pack::build_variant_stub(&ws_root, seed).map_err(map_shell_err)?)
+            }
+            Err(_) => {
+                eprintln!("protect: no workspace found, using bundled stub");
+                None
+            }
+        };
         Packer::new()
-            .pack_protected(&bc_bytes, opts, Some(&stub))
+            .pack_protected(&bc_bytes, opts, variant_stub.as_deref())
             .map_err(map_shell_err)?
     } else {
         Packer::new().pack(&bc_bytes).map_err(map_shell_err)?

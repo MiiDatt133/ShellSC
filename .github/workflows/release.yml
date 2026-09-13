@@ -1,0 +1,136 @@
+name: release
+
+# Cross-compile prebuilt binaries for all 4 supported arches on a single
+# x86_64 runner. Termux targets (armv7/aarch64) link against bionic via
+# cargo-ndk + the NDK; PC targets use cross gcc (i686) or native (x86_64).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: armv7a
+            rust_target: armv7-linux-androideabi24
+            stub: stub-armv7l.elf
+            ndk: true
+          - name: aarch64
+            rust_target: aarch64-linux-android24
+            stub: stub-aarch64.elf
+            ndk: true
+          - name: x86_64
+            rust_target: x86_64-unknown-linux-gnu
+            stub: stub-x86_64.elf
+          - name: i686
+            rust_target: i686-unknown-linux-gnu
+            stub: stub-i686.elf
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ matrix.rust_target }}-${{ hashFiles('**/Cargo.toml') }}
+
+      - name: Install NDK linkers (Android targets)
+        if: matrix.ndk
+        run: |
+          cargo install cargo-ndk --version 0.3.7
+          curl -fsSL -o ndk.zip \
+            "https://dl.google.com/android/repository/android-ndk-r27-linux.zip"
+          unzip -q ndk.zip -d "$RUNNER_TEMP"
+          echo "ANDROID_NDK_HOME=$(echo $RUNNER_TEMP/android-ndk-*)" >> "$GITHUB_ENV"
+
+      - name: Install cross gcc (i686)
+        if: matrix.rust_target == 'i686-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-i686-linux-gnu
+
+      # shell_stub is a workspace member, not a dependency of shellsc, so
+      # build both binaries with the same --target.
+      - name: Build (Android)
+        if: matrix.ndk
+        run: |
+          cargo ndk -t ${{ matrix.rust_target }} build --release -p shellsc -p shell_stub
+          mkdir -p stubs_tmp
+          cp "target/${{ matrix.rust_target }}/release/shellsc" stubs_tmp/
+          cp "target/${{ matrix.rust_target }}/release/shell_stub" stubs_tmp/
+
+      - name: Build (PC)
+        if: ${{ !matrix.ndk }}
+        run: |
+          if [ "${{ matrix.rust_target }}" = "i686-unknown-linux-gnu" ]; then
+            mkdir -p .cargo
+            printf '[target.i686-unknown-linux-gnu]\nlinker = "i686-linux-gnu-gcc"\n' \
+              > .cargo/config.toml
+          fi
+          cargo build --release -p shellsc -p shell_stub --target ${{ matrix.rust_target }}
+          mkdir -p stubs_tmp
+          cp "target/${{ matrix.rust_target }}/release/shellsc" stubs_tmp/
+          cp "target/${{ matrix.rust_target }}/release/shell_stub" stubs_tmp/
+
+      # Layout must match elf_stub.rs candidate_stub_paths(): the stub
+      # sits in a `stubs/` dir next to the shellsc binary under its arch
+      # name (stubs/stub-<arch>.elf).
+      - name: Package tarball
+        run: |
+          mkdir -p "dist/shellsc-${{ matrix.name }}/stubs"
+          cp stubs_tmp/shellsc "dist/shellsc-${{ matrix.name }}/"
+          cp stubs_tmp/shell_stub "dist/shellsc-${{ matrix.name }}/stubs/${{ matrix.stub }}"
+          cp LICENSE README.md "dist/shellsc-${{ matrix.name }}/"
+          chmod +x "dist/shellsc-${{ matrix.name }}/shellsc"
+          tar -C dist -czf "shellsc-${{ matrix.name }}.tar.gz" "shellsc-${{ matrix.name }}"
+
+      # Smoke-test the x86_64 build natively on the runner: compile a
+      # trivial script (plain + --protect, protected rebuilds the stub
+      # variant with --target so this exercises the cross-variant path)
+      # and run both .sc files.
+      - name: Smoke test (x86_64)
+        if: matrix.rust_target == 'x86_64-unknown-linux-gnu'
+        run: |
+          printf 'echo smoke\n' > t.smoke.sh
+          export SHELLSC_VARIANT_TARGET=x86_64-unknown-linux-gnu
+          dist/shellsc-x86_64/shellsc build t.smoke.sh -o t1.sc
+          dist/shellsc-x86_64/shellsc build --protect t.smoke.sh -o t2.sc
+          chmod +x t1.sc t2.sc
+          out1=$(env -u LD_PRELOAD ./t1.sc)
+          out2=$(env -u LD_PRELOAD ./t2.sc)
+          [ "$out1" = "$out2" ] && echo "smoke outputs match"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shellsc-${{ matrix.name }}
+          path: shellsc-${{ matrix.name }}.tar.gz
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*.tar.gz

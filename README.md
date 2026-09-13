@@ -8,7 +8,7 @@ Shell script compiler for Android and Linux. Compiles `.sh` scripts into standal
 
 ## Requirements
 
-- **Rust** (1.70+)
+- A prebuilt binary (see Install), or **Rust 1.70+** to build from source
 - On Termux: `pkg install rust`
 
 ## Supported Platforms
@@ -21,6 +21,24 @@ Shell script compiler for Android and Linux. Compiles `.sh` scripts into standal
 Build and run on the same architecture: the stub is compiled for your host arch during `cargo build`, and packed binaries run on that arch.
 
 ## Install
+
+Download the tarball for your CPU from
+[Releases](https://github.com/MiiDatt133/ShellSC/releases) — this line
+picks the right one automatically:
+
+```sh
+curl -LO https://github.com/MiiDatt133/ShellSC/releases/latest/download/shellsc-$( \
+  case "$(uname -m)" in \
+    armv7l|armv6l) echo armv7a ;; \
+    aarch64|arm64)  echo aarch64 ;; \
+    x86_64)         echo x86_64 ;; \
+    i686|i386)      echo i686 ;; \
+  esac).tar.gz
+tar -xzf shellsc-*.tar.gz
+./shellsc-*/shellsc build script.sh
+```
+
+Or build from source:
 
 ```sh
 git clone https://github.com/MiiDatt133/ShellSC.git
@@ -67,25 +85,22 @@ Not supported: write-mode process substitution `>(cmd)`, associative arrays (`de
 
 Available on `build` and `pack`. Use `--all` to enable every protection at once (`--protect --smc --self-debug`). A protected `.sc` prints `Protected by ShellSC` as its first line when run.
 
-- XOR encryption of bytecode with random per-build key
+- XOR encryption of bytecode with per-build random key
 - Per-build opcode shuffling (Fisher-Yates)
-- **Per-build stub variants** — every `--protect` build rebuilds the stub ELF with fresh guard constants and junk-op patterns baked into its machine code, so a handler trace from one build is useless against the next build
-- **Bytecode obfuscation passes (O-LLVM style)** — applied to the bytecode itself before sealing, so the encrypted stream hides a different CFG on every build:
-  - *Bogus control flow* — a seed-chosen subset of jumps is retargeted through decoy blocks of stack-neutral junk appended at the end of the stream; a static CFG sees extra blocks and edges that runtime never distinguishes from real ones
-  - *Instruction substitution* — long pool strings are split into `PushConst(a) PushConst(b) ConcatN(2)` at seed-chosen cut points, so no single pool entry holds a full literal for a static string dump
+- Per-build stub variants — every protected build rebuilds the stub with fresh guard constants
+- Bytecode obfuscation passes, applied before sealing:
+  - Bogus control flow — a subset of jumps routes through appended decoy junk blocks
+  - Instruction substitution — long pool strings split into `PushConst(a) PushConst(b) ConcatN(2)`
 - Control-flow flattening + opaque predicates
 - Virtualized dispatch obfuscation
-- **Seeded-header masking (v4)** — the opcode-shuffle and CFF seeds are stored XOR-masked with the stub `.text` CRC; the header alone reveals nothing about the dispatch tables
-- Self-modifying bytecode (`--smc`): decrypt one instruction at a time, with three anti-decode layers:
-  - **Chained keystream** — each instruction's keystream derives from the decoded bytes of the previous one, so decryption must replay from instruction 0 in order (no parallel/sliced unpacking)
-  - **Runtime salt** — const-pool strings, heredoc bodies and function names are masked with a per-process entropy value that exists only in the live process, never in the `.sc` file; static decryption with the correct key still yields garbage
-  - **Polymorphic mixers** — the keystream generator itself is picked per build from 4 structurally different algorithm shapes, so two builds of the same script run different decode algorithms
-- Anti-debug (ptrace check), anti-hook (LD_PRELOAD/Frida detection), **all via raw syscalls** — the checks never call libc `open`/`read`/`fork`/`ptrace`, so a preloaded library cannot interpose them; LD_PRELOAD is read from the kernel's own `/proc/self/environ` snapshot, which `unsetenv()` in a preload constructor cannot clean
-- Self-debug (`--self-debug`): fork a child that ptrace-attaches the parent, occupying the single tracer slot so no external debugger can attach
+- Seeded-header masking (v4) — seeds stored XOR-masked with the stub `.text` CRC
+- Self-modifying bytecode (`--smc`) — decrypt one instruction at a time; chained keystream, per-process runtime salt, keystream generator picked per build from 4 shapes
+- Anti-debug (TracerPid check) and anti-hook (LD_PRELOAD, hook-framework markers in `/proc/self/maps`), read via raw syscalls — a preloaded library cannot interpose them; LD_PRELOAD is read from the kernel's `/proc/self/environ` snapshot, which `unsetenv()` cannot clean
+- Self-debug (`--self-debug`) — child process ptrace-attaches the parent, taking the tracer slot
 - CRC32 integrity verification
-- **Key derivation from stub `.text`** — the XOR key is masked with the CRC32 of the stub's own `.text` section and re-derived at runtime from the mapped ELF; patching a single byte inside `.text` (e.g. NOP-ing an anti-debug check) invalidates the key and the binary refuses to run
+- Key derivation from stub `.text` — patching one byte of `.text` invalidates the key
 
-Note: a protected build compiles a fresh stub variant (takes a few minutes on the first run; faster afterwards thanks to per-seed incremental caches).
+Note: a protected build compiles a fresh stub variant (slow on first run, cached per seed afterwards). With a prebuilt shellsc that has no source workspace on the machine, `--protect` uses the bundled stub instead: same encryption and checks, without the per-build stub code variation.
 
 ## Structure
 
@@ -100,8 +115,4 @@ crates/
   shell_stub/   — stub loader
   shellsc/      — CLI
 ```
-
----
-
-[#ShellSC](https://github.com/search?q=ShellSC) · [#RustLang](https://github.com/search?q=RustLang) · [#ShellScripting](https://github.com/search?q=ShellScripting) · [#Obfuscation](https://github.com/search?q=Obfuscation) · [#AntiDebugging](https://github.com/search?q=AntiDebugging) · [#ReverseEngineering](https://github.com/search?q=ReverseEngineering) · [#CyberSecurity](https://github.com/search?q=CyberSecurity) · [#LinuxDev](https://github.com/search?q=LinuxDev) · [#AndroidSecurity](https://github.com/search?q=AndroidSecurity) · [#Compiler](https://github.com/search?q=Compiler) · [#OpenSource](https://github.com/search?q=OpenSource) · [#GitHub](https://github.com/search?q=GitHub)
 
