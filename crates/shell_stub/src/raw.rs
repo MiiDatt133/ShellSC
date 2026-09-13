@@ -151,9 +151,8 @@ pub unsafe fn syscall5(n: i64, a: usize, b: usize, c: usize, d: usize, e: usize)
 // i386 syscall: number in eax, args in ebx,ecx,edx,esi,edi. LLVM
 // reserves esi internally on 32-bit and rejects naming it in inline
 // asm, so shuffle registers inside a naked function. PIC builds also
-// reserve ebx — save/restore it explicitly.
-//
-// C ABI on entry: [sp+0] = return address, [sp+4..] = args 0..4.
+// reserve ebx — save/restore it explicitly. x86 rustc asm is Intel
+// syntax by default (no % prefixes, no $ immediates).
 #[cfg(target_arch = "x86")]
 #[unsafe(naked)]
 unsafe extern "C" fn syscall5_x86(
@@ -165,20 +164,20 @@ unsafe extern "C" fn syscall5_x86(
     _e: usize,
 ) -> usize {
     core::arch::naked_asm!(
-        "push %ebp",
-        "mov %esp, %ebp",
-        "push %ebx",
-        "push %esi",
-        "mov 8(%ebp), %eax",
-        "mov 12(%ebp), %ebx",
-        "mov 16(%ebp), %ecx",
-        "mov 20(%ebp), %edx",
-        "mov 24(%ebp), %esi",
-        "mov 28(%ebp), %edi",
-        "int $0x80",
-        "pop %esi",
-        "pop %ebx",
-        "pop %ebp",
+        "push ebp",
+        "mov ebp, esp",
+        "push ebx",
+        "push esi",
+        "mov eax, [ebp + 8]",
+        "mov ebx, [ebp + 12]",
+        "mov ecx, [ebp + 16]",
+        "mov edx, [ebp + 20]",
+        "mov esi, [ebp + 24]",
+        "mov edi, [ebp + 28]",
+        "int 0x80",
+        "pop esi",
+        "pop ebx",
+        "pop ebp",
         "ret",
     );
 }
