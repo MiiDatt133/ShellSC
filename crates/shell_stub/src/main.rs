@@ -104,16 +104,20 @@ fn run() -> Result<()> {
 
             let mut vm = Vm::new(bc);
             if let Some(h) = &header_opt {
+                // v4 headers store the seeds XOR-masked with the .text CRC —
+                // derive the runtime values the same way open() does.
+                let real_version = payload.get(12).copied().unwrap_or(0);
+                let seeds = shell_pack::derive_seeds(h, real_version, text_crc);
                 if h.flags & shell_pack::protect::FLAG_CFF != 0
                     || h.flags & shell_pack::protect::FLAG_OPAQUE != 0
                 {
-                    vm.enable_cff(h.cff_seed, h.opaque_param1, h.opaque_param2);
+                    vm.enable_cff(seeds.cff_seed, h.opaque_param1, h.opaque_param2);
                 }
                 if h.flags & shell_pack::protect::FLAG_SMC != 0 {
                     let mut k = h.key;
                     for (i, b) in k.iter_mut().enumerate() {
                         *b = b.wrapping_add(h.crc32 as u8).rotate_left(2)
-                            ^ (h.cff_seed as u8).wrapping_mul(31 ^ i as u8);
+                            ^ (seeds.cff_seed as u8).wrapping_mul(31 ^ i as u8);
                     }
                     vm.enable_smc(k);
                     k.iter_mut().for_each(|b| *b = 0);

@@ -62,8 +62,12 @@ fn cmd_pack(m: &ArgMatches) -> Result<()> {
         let mut opts = shell_pack::ProtectOptions::all();
         opts.smc = smc;
         opts.selfdebug = selfdebug;
+        let seed = shell_pack::variant_seed();
+        let ws_root = shell_pack::workspace_root().map_err(map_shell_err)?;
+        eprintln!("protect: building stub variant {seed} (first build is slow)…");
+        let stub = shell_pack::build_variant_stub(&ws_root, seed).map_err(map_shell_err)?;
         shell_pack::Packer::new()
-            .pack_protected(&bc_bytes, opts)
+            .pack_protected(&bc_bytes, opts, Some(&stub))
             .map_err(map_shell_err)?
     } else {
         shell_pack::Packer::new()

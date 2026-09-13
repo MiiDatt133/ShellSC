@@ -36,8 +36,14 @@ pub fn full_pipeline(
         let mut opts = shell_pack::ProtectOptions::all();
         opts.smc = smc;
         opts.selfdebug = selfdebug;
+        // Per-build stub variant: rebuild the stub with fresh guard
+        // constants so its machine code differs on every protected build.
+        let seed = shell_pack::variant_seed();
+        let ws_root = shell_pack::workspace_root().map_err(map_shell_err)?;
+        eprintln!("protect: building stub variant {seed} (first build is slow)…");
+        let stub = shell_pack::build_variant_stub(&ws_root, seed).map_err(map_shell_err)?;
         Packer::new()
-            .pack_protected(&bc_bytes, opts)
+            .pack_protected(&bc_bytes, opts, Some(&stub))
             .map_err(map_shell_err)?
     } else {
         Packer::new().pack(&bc_bytes).map_err(map_shell_err)?

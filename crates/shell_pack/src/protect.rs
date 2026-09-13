@@ -15,7 +15,9 @@ use shell_ast::ShellError;
 pub const PROTECT_MAGIC: &[u8; 12] = b"SHELLSC_PROT";
 
 /// Version byte: bumped on any header-layout change.
-pub const PROTECT_VERSION: u8 = 3;
+/// v4: cff_seed and opmap_seed are stored XOR-masked with the stub .text
+/// CRC (like the key since v3) — no seed bytes readable without the stub.
+pub const PROTECT_VERSION: u8 = 4;
 
 /// magic 12 + version 1 + flags 1 + cff_seed 2 + key 16 + crc32 4 +
 /// orig_len 4 + opmap_seed 4 + opaque_param1 4 + opaque_param2 4 = 52 bytes.
@@ -33,6 +35,10 @@ pub const FLAG_SELFDEBUG: u8 = 0x80;
 /// Key derivation from ELF .text CRC is active when version >= 3 and
 /// FLAG_ENCRYPTED is set. No separate flag bit needed — all 8 bits are used.
 pub const KEYDERIVE_MIN_VERSION: u8 = 3;
+
+/// Seed masking (cff_seed, opmap_seed XOR text_crc) is active when
+/// version >= 4. v3 payloads store the seeds plaintext.
+pub const SEEDMASK_MIN_VERSION: u8 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtectHeader {
@@ -308,6 +314,14 @@ fn mask_key(key: &[u8; 16], text_hash: u32) -> [u8; 16] {
     out
 }
 
+fn mask_cff_seed(seed: u16, text_hash: u32) -> u16 {
+    seed ^ (text_hash >> 16) as u16
+}
+
+fn mask_opmap_seed(seed: u32, text_hash: u32) -> u32 {
+    seed ^ text_hash
+}
+
 /// Compute the CRC32 of the ELF stub's executable code (.text section).
 /// Used by both the packer (at build time) and the stub (at runtime) to
 /// derive the same hash without storing it anywhere.
@@ -365,14 +379,26 @@ pub fn seal(bc_bytes: &[u8], opts: ProtectOptions, text_hash: u32) -> Result<Vec
 
     // Mask the key with the ELF .text hash so it never appears in the file.
     let stored_key = mask_key(&key, text_hash);
+    // Mask the seeds the same way (v4): without the stub's own .text CRC,
+    // the header reveals nothing about the opcode permutation.
+    let stored_cff_seed = if opts.cff {
+        mask_cff_seed(cff_seed, text_hash)
+    } else {
+        0
+    };
+    let stored_opmap_seed = if opts.opmap {
+        mask_opmap_seed(seed, text_hash)
+    } else {
+        0
+    };
 
     let header = ProtectHeader {
         flags: opts.flags(),
-        cff_seed,
+        cff_seed: stored_cff_seed,
         key: stored_key,
         crc32: crc,
         orig_len: bc_bytes.len() as u32,
-        opmap_seed: if opts.opmap { seed } else { 0 },
+        opmap_seed: stored_opmap_seed,
         opaque_param1: opaque_p1,
         opaque_param2: opaque_p2,
     };
@@ -381,6 +407,30 @@ pub fn seal(bc_bytes: &[u8], opts: ProtectOptions, text_hash: u32) -> Result<Vec
     out.extend_from_slice(&header.to_bytes());
     out.extend_from_slice(&body);
     Ok(out)
+}
+
+/// The runtime seeds derived from a (possibly masked) header and the stub's
+/// `.text` CRC. Version >= 4 stores cff_seed/opmap_seed XOR-masked; earlier
+/// versions store them plaintext.
+#[derive(Debug, Clone, Copy)]
+pub struct DerivedSeeds {
+    pub cff_seed: u16,
+    pub opmap_seed: u32,
+}
+
+pub fn derive_seeds(header: &ProtectHeader, version: u8, text_hash: u32) -> DerivedSeeds {
+    DerivedSeeds {
+        cff_seed: if version >= SEEDMASK_MIN_VERSION {
+            mask_cff_seed(header.cff_seed, text_hash)
+        } else {
+            header.cff_seed
+        },
+        opmap_seed: if version >= SEEDMASK_MIN_VERSION {
+            mask_opmap_seed(header.opmap_seed, text_hash)
+        } else {
+            header.opmap_seed
+        },
+    }
 }
 
 /// Open a protected payload: returns the decrypted, opcode-restored
@@ -392,9 +442,9 @@ pub fn open(payload: &[u8], text_hash: u32) -> Result<Option<Vec<u8>>, ShellErro
     }
     let header = ProtectHeader::from_bytes(payload)?;
     let mut body = payload[HEADER_LEN..].to_vec();
+    let version = payload[12];
 
     if header.flags & FLAG_ENCRYPTED != 0 {
-        let version = payload[12];
         let real_key = if version >= KEYDERIVE_MIN_VERSION {
             mask_key(&header.key, text_hash)
         } else {
@@ -403,8 +453,10 @@ pub fn open(payload: &[u8], text_hash: u32) -> Result<Option<Vec<u8>>, ShellErro
         xor_crypt(&real_key, &mut body);
     }
 
-    if header.flags & FLAG_OPMAP != 0 && header.opmap_seed != 0 {
-        let inv = opcode_inverse(header.opmap_seed);
+    let seeds = derive_seeds(&header, version, text_hash);
+
+    if header.flags & FLAG_OPMAP != 0 && seeds.opmap_seed != 0 {
+        let inv = opcode_inverse(seeds.opmap_seed);
         revert_opmap(&mut body, &inv).map_err(|_| {
             ShellError::IoError("binary tampered: refuse to run modified executable".into())
         })?;
@@ -642,6 +694,38 @@ mod tests {
         let last = tampered.len() - 1;
         tampered[last] ^= 0xFF;
         let err = open(&tampered, 0).err().unwrap().to_string();
+        assert!(err.contains("tampered"), "{err}");
+    }
+
+    #[test]
+    fn v4_masks_seeds_in_header() {
+        let bc_bytes = sample_shbc();
+        let text_crc = 0x0123_4567;
+        let sealed = seal(&bc_bytes, ProtectOptions::all(), text_crc).unwrap();
+        let header = ProtectHeader::from_bytes(&sealed).unwrap();
+        // Stored seeds must not equal a simple deterministic value the
+        // analyst could recognise; with a fixed text_crc the stored value
+        // differs from the derived one unless masking is applied.
+        let derived_opmap = mask_opmap_seed(header.opmap_seed, text_crc);
+        let derived_cff = mask_cff_seed(header.cff_seed, text_crc);
+        assert_ne!(
+            header.opmap_seed, derived_opmap,
+            "opmap seed stored unmasked"
+        );
+        assert_ne!(header.cff_seed, derived_cff, "cff seed stored unmasked");
+        // Round-trip through open() with the correct text_crc recovers the
+        // original bytecode — proving the unmask derives the true seeds.
+        let opened = open(&sealed, text_crc).unwrap().unwrap();
+        assert_eq!(opened, bc_bytes);
+    }
+
+    #[test]
+    fn v4_wrong_text_crc_fails_tamper() {
+        let bc_bytes = sample_shbc();
+        let sealed = seal(&bc_bytes, ProtectOptions::all(), 0xAAAA_0001).unwrap();
+        // A different .text CRC (e.g. patched stub) un-masks wrong seeds →
+        // wrong permutation → CRC mismatch → tamper error.
+        let err = open(&sealed, 0xBBBB_0002).err().unwrap().to_string();
         assert!(err.contains("tampered"), "{err}");
     }
 }

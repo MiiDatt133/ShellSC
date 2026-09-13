@@ -69,8 +69,10 @@ Available on `build` and `pack`. Use `--all` to enable every protection at once 
 
 - XOR encryption of bytecode with random per-build key
 - Per-build opcode shuffling (Fisher-Yates)
+- **Per-build stub variants** — every `--protect` build rebuilds the stub ELF with fresh guard constants and junk-op patterns baked into its machine code, so a handler trace from one build is useless against the next build
 - Control-flow flattening + opaque predicates
 - Virtualized dispatch obfuscation
+- **Seeded-header masking (v4)** — the opcode-shuffle and CFF seeds are stored XOR-masked with the stub `.text` CRC; the header alone reveals nothing about the dispatch tables
 - Self-modifying bytecode (`--smc`): decrypt one instruction at a time, with three anti-decode layers:
   - **Chained keystream** — each instruction's keystream derives from the decoded bytes of the previous one, so decryption must replay from instruction 0 in order (no parallel/sliced unpacking)
   - **Runtime salt** — const-pool strings, heredoc bodies and function names are masked with a per-process entropy value that exists only in the live process, never in the `.sc` file; static decryption with the correct key still yields garbage
@@ -79,6 +81,8 @@ Available on `build` and `pack`. Use `--all` to enable every protection at once 
 - Self-debug (`--self-debug`): fork a child that ptrace-attaches the parent, occupying the single tracer slot so no external debugger can attach
 - CRC32 integrity verification
 - **Key derivation from stub `.text`** — the XOR key is masked with the CRC32 of the stub's own `.text` section and re-derived at runtime from the mapped ELF; patching a single byte inside `.text` (e.g. NOP-ing an anti-debug check) invalidates the key and the binary refuses to run
+
+Note: a protected build compiles a fresh stub variant (takes a few minutes on the first run; faster afterwards thanks to per-seed incremental caches).
 
 ## Structure
 

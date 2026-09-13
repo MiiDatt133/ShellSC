@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use goblin::elf::Elf;
 use shell_ast::ShellError;
 
@@ -28,15 +30,22 @@ impl Packer {
 
     /// Seal the bytecode (encrypt + opcode shuffle + CRC) and inject it
     /// as the `.shellsc` section. The stub reverses this at load time.
+    /// `variant_stub` — when set — is a per-build stub binary whose machine
+    /// code was rebuilt from a fresh seed; its .text CRC keys the seal.
     pub fn pack_protected(
         &self,
         bc_bytes: &[u8],
         opts: ProtectOptions,
+        variant_stub: Option<&Path>,
     ) -> Result<Vec<u8>, ShellError> {
         if !opts.is_any() {
             return self.pack(bc_bytes);
         }
-        let stub = stub_bytes()?;
+        let stub = match variant_stub {
+            Some(p) => std::fs::read(p)
+                .map_err(|e| ShellError::IoError(format!("reading variant stub: {}", e)))?,
+            None => stub_bytes()?,
+        };
         validate_stub(&stub)?;
         let text_crc = compute_stub_text_crc(&stub);
         let sealed = seal(bc_bytes, opts, text_crc)?;

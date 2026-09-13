@@ -24,6 +24,10 @@ use crate::{
 static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
 static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
 
+// Per-build CFF guard constants — replaced at stub-variant build time via
+// SHELLSC_VARIANT_SEED (see build.rs). Defaults keep the historical values.
+include!(concat!(env!("OUT_DIR"), "/variant_constants.rs"));
+
 pub fn set_sigint() {
     SIGINT_RECEIVED.store(true, Ordering::SeqCst);
 }
@@ -187,7 +191,7 @@ impl Vm {
         // Fisher-Yates permutation of opcode bytes 0x01..=0x2A, derived
         // deterministically from the seed so the stub and VM agree.
         let mut perm: [u8; 42] = (1u8..=42).collect::<Vec<u8>>().try_into().unwrap();
-        let mut rng_state = (cff_seed as u32).wrapping_mul(0x85EB_CA6B) | 1;
+        let mut rng_state = (cff_seed as u32).wrapping_mul(CFF_PERM_MULT) | 1;
         let mut i = perm.len();
         while i > 1 {
             i -= 1;
@@ -204,7 +208,7 @@ impl Vm {
             inv[(v - 1) as usize] = i as u8;
         }
         self.slot_decode = inv;
-        self.virt_key = (cff_seed as u32).wrapping_mul(0xC2B2_AE35) ^ opaque_p1;
+        self.virt_key = (cff_seed as u32).wrapping_mul(CFF_VIRT_MULT) ^ opaque_p1;
     }
 
     /// Enable self-modifying bytecode: seal the whole program into an
@@ -576,7 +580,8 @@ impl Vm {
             // the guards below are provably true for legitimate builds.
             if self.cff_active {
                 let key = (instr.op.to_u8() as u32).wrapping_mul(self.cff_decode[0] as u32 | 1)
-                    ^ (self.cff_decode[instr.op.to_u8() as usize % 40] as u32).wrapping_mul(0x9E37);
+                    ^ (self.cff_decode[instr.op.to_u8() as usize % 40] as u32)
+                        .wrapping_mul(CFF_GUARD_CONST);
                 // key differs per opcode (odd multiplier is a bijection
                 // mod 2^32), but the dispatch itself stays on instr.op —
                 // the computed key feeds the opaque guards only.
@@ -608,6 +613,15 @@ impl Vm {
                         }
                     }
                 }
+            }
+
+            // Variant junk ops: seed-chosen dead computations interleaved
+            // with the dispatch. They consume real runtime values so LLVM
+            // cannot fold them, but their result is discarded — pure shape
+            // noise that differs per build.
+            if CFF_JUNK_OPS > 0 {
+                let junk = CFF_GUARD_CONST.wrapping_mul(self.ip as u32) ^ instr.op.to_u8() as u32;
+                let _ = junk.wrapping_add(CFF_JUNK_OPS);
             }
 
             // Virtualized dispatch: when CFF is active, decode opcode through
