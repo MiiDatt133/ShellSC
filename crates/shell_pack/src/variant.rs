@@ -21,14 +21,18 @@ pub fn build_variant_stub(ws_root: &Path, seed: u32) -> Result<PathBuf, ShellErr
     std::fs::create_dir_all(&target_dir)
         .map_err(|e| ShellError::IoError(format!("variant target dir: {}", e)))?;
 
-    let status = Command::new("cargo")
-        .env("SHELLSC_VARIANT_SEED", seed.to_string())
+    let target = target_arg();
+    let mut cmd = Command::new("cargo");
+    cmd.env("SHELLSC_VARIANT_SEED", seed.to_string())
         .env("CARGO_TARGET_DIR", &target_dir)
         .arg("build")
         .arg("--release")
         .arg("-p")
-        .arg("shell_stub")
-        .args(target_arg())
+        .arg("shell_stub");
+    if let Some(t) = &target {
+        cmd.arg("--target").arg(t);
+    }
+    let status = cmd
         .current_dir(ws_root)
         .status()
         .map_err(|e| ShellError::IoError(format!("spawn cargo: {}", e)))?;
@@ -38,7 +42,7 @@ pub fn build_variant_stub(ws_root: &Path, seed: u32) -> Result<PathBuf, ShellErr
         )));
     }
 
-    let stub = match target_arg() {
+    let stub = match &target {
         Some(t) => target_dir.join(t).join("release/shell_stub"),
         None => target_dir.join("release/shell_stub"),
     };

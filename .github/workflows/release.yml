@@ -19,11 +19,11 @@ jobs:
       matrix:
         include:
           - name: armv7a
-            rust_target: armv7-linux-androideabi24
+            rust_target: armv7-linux-androideabi
             stub: stub-armv7l.elf
             ndk: true
           - name: aarch64
-            rust_target: aarch64-linux-android24
+            rust_target: aarch64-linux-android
             stub: stub-aarch64.elf
             ndk: true
           - name: x86_64

@@ -154,7 +154,7 @@ pub unsafe fn syscall5(n: i64, a: usize, b: usize, c: usize, d: usize, e: usize)
     let ret;
     core::arch::asm!(
         "int $$0x80",
-        in("eax") n,
+        in("eax") n as u32,
         in("ebx") a, in("ecx") b, in("edx") c, in("esi") d, in("edi") e,
         lateout("eax") ret,
         options(nostack)
