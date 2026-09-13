@@ -1,5 +1,6 @@
+mod raw;
+
 use std::{
-    fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -45,7 +46,11 @@ fn main() {
 fn run() -> Result<()> {
     register_signal_handlers();
     let exe = exe_path()?;
-    let bytes = fs::read(&exe).with_context(|| format!("reading {}", exe.display()))?;
+    // Read the ELF through a raw syscall: the anti-tamper key is derived
+    // from these bytes, so an interposed libc read must not be able to
+    // hand back modified contents.
+    let bytes = unsafe { raw::raw_open_read(&exe.to_string_lossy()) }
+        .with_context(|| format!("reading {}", exe.display()))?;
 
     let elf = Elf::parse(&bytes).map_err(|e| anyhow::anyhow!("parsing ELF: {}", e))?;
 
@@ -69,16 +74,13 @@ fn run() -> Result<()> {
                 0
             };
 
-            // Harden BEFORE decryption so no plaintext window exists
-            // between open() and harden — closes crash-dump exposure.
-            if is_protected {
-                anti_dump_harden(&bytes);
-            }
-
             let mut bc_bytes: Vec<u8> = if is_protected {
                 eprintln!("Protected by ShellSC");
                 let header = shell_pack::ProtectHeader::from_bytes(payload)
                     .map_err(|e| anyhow::anyhow!("protect header: {}", e))?;
+                // PR_SET_DUMPABLE=0 makes the kernel deny reads of this
+                // process's own /proc/self/environ and PTRACE_ATTACH — run
+                // the checks before hardening, harden before decryption.
                 if header.flags & shell_pack::protect::FLAG_ANTIDEBUG != 0 {
                     antidebug_check()?;
                 }
@@ -88,6 +90,7 @@ fn run() -> Result<()> {
                 if header.flags & shell_pack::protect::FLAG_SELFDEBUG != 0 {
                     selfdebug_check()?;
                 }
+                anti_dump_harden(&bytes);
                 let bc = shell_pack::open(payload, text_crc)
                     .map_err(|e| anyhow::anyhow!("unsealing bytecode: {}", e))?
                     .context("protected payload too short")?;
@@ -137,9 +140,13 @@ fn run() -> Result<()> {
 }
 
 /// Refuse to run under a tracer (ptrace-based debugger / strace).
+/// Reads /proc/self/status via a raw syscall — an interposed libc
+/// `open`/`read` cannot fake the TracerPid line.
 fn antidebug_check() -> Result<()> {
-    let status = fs::read_to_string("/proc/self/status").context("reading /proc/self/status")?;
-    for line in status.lines() {
+    let status =
+        unsafe { raw::raw_open_read("/proc/self/status").context("reading /proc/self/status")? };
+    let text = String::from_utf8_lossy(&status);
+    for line in text.lines() {
         if let Some(rest) = line.strip_prefix("TracerPid:") {
             let pid: i64 = rest.trim().parse().context("parsing TracerPid")?;
             if pid != 0 {
@@ -151,16 +158,26 @@ fn antidebug_check() -> Result<()> {
     bail!("TracerPid not found in /proc/self/status")
 }
 
-/// Refuse to run with library hooks in play.
+/// Refuse to run with library hooks in play. Three signals:
+/// 1. LD_PRELOAD read from the kernel's own /proc/self/environ snapshot —
+///    an unsetenv() in a preload constructor does not clean this copy.
+/// 2. /proc/self/maps via raw syscall — interposition cannot filter lines.
+/// 3. frida-style gadget libraries visible in the map.
 fn antihook_check() -> Result<()> {
-    if let Ok(v) = std::env::var("LD_PRELOAD") {
-        if !v.trim().is_empty() {
-            bail!("refusing to run with LD_PRELOAD set");
+    if let Some(env) = unsafe { raw::raw_open_read("/proc/self/environ") } {
+        for kv in env.split(|b| *b == 0) {
+            if let Ok(s) = std::str::from_utf8(kv) {
+                if let Some(v) = s.strip_prefix("LD_PRELOAD=") {
+                    if !v.trim().is_empty() {
+                        bail!("refusing to run with LD_PRELOAD set");
+                    }
+                }
+            }
         }
     }
-    let maps = fs::read_to_string("/proc/self/maps").context("reading /proc/self/maps")?;
+    let maps = unsafe { raw::raw_open_read("/proc/self/maps").context("reading /proc/self/maps")? };
     const HOOK_MARKERS: [&str; 6] = ["frida", "gadget", "xposed", "substrate", "lsposed", "cydia"];
-    let maps_lower = maps.to_lowercase();
+    let maps_lower = String::from_utf8_lossy(&maps).to_lowercase();
     for m in HOOK_MARKERS {
         if maps_lower.contains(m) {
             bail!("refusing to run: hook framework marker '{m}' in memory map");
@@ -172,71 +189,57 @@ fn antihook_check() -> Result<()> {
 /// Fork a child that ptrace-attaches the parent, occupying the single
 /// tracer slot so no external debugger can attach. Uses a pipe to block
 /// the parent until the child has completed PTRACE_ATTACH, closing the
-/// race window where an external debugger could slip in.
+/// race window where an external debugger could slip in. All syscalls
+/// are raw — a preloaded library cannot interpose fork/ptrace/wait to
+/// fake the attach or hand the slot to its own tracer.
 fn selfdebug_check() -> Result<()> {
     unsafe {
         let mut pipefd = [0i32; 2];
-        if libc::pipe(pipefd.as_mut_ptr()) < 0 {
+        if raw::raw_pipe(&mut pipefd) < 0 {
             bail!("self-debug: pipe failed");
         }
-        let pid = libc::fork();
+        let pid = raw::raw_fork();
         if pid < 0 {
             bail!("self-debug: fork failed");
         }
         if pid == 0 {
-            libc::close(pipefd[0]);
-            let ppid = libc::getppid();
-            if libc::ptrace(
-                libc::PTRACE_ATTACH,
-                ppid,
-                std::ptr::null_mut::<libc::c_void>(),
-                std::ptr::null_mut::<libc::c_void>(),
-            ) < 0
-            {
-                libc::_exit(1);
+            raw::raw_close(pipefd[0] as usize);
+            let ppid = raw::raw_getppid();
+            if raw::raw_ptrace(raw::PTRACE_ATTACH, ppid, 0, 0) < 0 {
+                raw::raw_exit_group(1);
             }
-            let mut status: libc::c_int = 0;
-            if libc::waitpid(ppid, &mut status, 0) > 0 && libc::WIFSTOPPED(status) {
-                libc::ptrace(
-                    libc::PTRACE_CONT,
-                    ppid,
-                    std::ptr::null_mut::<libc::c_void>(),
-                    std::ptr::null_mut::<libc::c_void>(),
-                );
+            let mut status: i32 = 0;
+            if raw::raw_waitpid(ppid, &mut status) > 0 && raw::wif_stopped(status) {
+                raw::raw_ptrace(raw::PTRACE_CONT, ppid, 0, 0);
                 let buf = [1u8; 1];
-                let _ = libc::write(pipefd[1], buf.as_ptr() as *const libc::c_void, 1);
+                let _ = raw::raw_write(pipefd[1] as usize, &buf);
             } else {
-                libc::_exit(1);
+                raw::raw_exit_group(1);
             }
-            libc::close(pipefd[1]);
+            raw::raw_close(pipefd[1] as usize);
             loop {
-                if libc::waitpid(ppid, &mut status, 0) <= 0 {
+                if raw::raw_waitpid(ppid, &mut status) <= 0 {
                     break;
                 }
-                if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                if raw::wif_exited(status) || raw::wif_signaled(status) {
                     break;
                 }
-                if libc::WIFSTOPPED(status) {
-                    let sig = libc::WSTOPSIG(status);
-                    let deliver = if sig == libc::SIGSTOP || sig == libc::SIGTRAP {
+                if raw::wif_stopped(status) {
+                    let sig = raw::w_stop_sig(status);
+                    let deliver = if sig == raw::SIG_STOP || sig == raw::SIG_TRAP {
                         0
                     } else {
                         sig
                     };
-                    libc::ptrace(
-                        libc::PTRACE_CONT,
-                        ppid,
-                        std::ptr::null_mut::<libc::c_void>(),
-                        deliver as *mut libc::c_void,
-                    );
+                    raw::raw_ptrace(raw::PTRACE_CONT, ppid, 0, deliver as usize);
                 }
             }
-            libc::_exit(0);
+            raw::raw_exit_group(0);
         }
-        libc::close(pipefd[1]);
+        raw::raw_close(pipefd[1] as usize);
         let mut buf = [0u8; 1];
-        let _ = libc::read(pipefd[0], buf.as_mut_ptr() as *mut libc::c_void, 1);
-        libc::close(pipefd[0]);
+        let _ = raw::raw_read(pipefd[0] as usize, &mut buf);
+        raw::raw_close(pipefd[0] as usize);
     }
     Ok(())
 }
