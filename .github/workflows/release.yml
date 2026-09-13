@@ -51,7 +51,7 @@ jobs:
       - name: Install NDK linkers (Android targets)
         if: matrix.ndk
         run: |
-          cargo install cargo-ndk --version 0.3.7
+          cargo install cargo-ndk
           curl -fsSL -o ndk.zip \
             "https://dl.google.com/android/repository/android-ndk-r27-linux.zip"
           unzip -q ndk.zip -d "$RUNNER_TEMP"

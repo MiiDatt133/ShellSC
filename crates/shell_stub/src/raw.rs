@@ -148,18 +148,46 @@ pub unsafe fn syscall5(n: i64, a: usize, b: usize, c: usize, d: usize, e: usize)
     ret
 }
 
+// i386 syscall: number in eax, args in ebx,ecx,edx,esi,edi. LLVM
+// reserves esi internally on 32-bit and rejects naming it in inline
+// asm, so shuffle registers inside a naked function. PIC builds also
+// reserve ebx — save/restore it explicitly.
+//
+// C ABI on entry: [sp+0] = return address, [sp+4..] = args 0..4.
+#[cfg(target_arch = "x86")]
+#[unsafe(naked)]
+unsafe extern "C" fn syscall5_x86(
+    _n: usize,
+    _a: usize,
+    _b: usize,
+    _c: usize,
+    _d: usize,
+    _e: usize,
+) -> usize {
+    core::arch::naked_asm!(
+        "push {{ebp}}",
+        "mov ebp, esp",
+        "push {{ebx}}",
+        "push {{esi}}",
+        "mov eax, [ebp+8]",
+        "mov ebx, [ebp+12]",
+        "mov ecx, [ebp+16]",
+        "mov edx, [ebp+20]",
+        "mov esi, [ebp+24]",
+        "mov edi, [ebp+28]",
+        "int $0x80",
+        "pop {{esi}}",
+        "pop {{ebx}}",
+        "pop {{ebp}}",
+        "ret",
+    );
+}
+
 #[cfg(target_arch = "x86")]
 #[inline(always)]
 pub unsafe fn syscall5(n: i64, a: usize, b: usize, c: usize, d: usize, e: usize) -> i64 {
-    let ret;
-    core::arch::asm!(
-        "int $$0x80",
-        in("eax") n as u32,
-        in("ebx") a, in("ecx") b, in("edx") c, in("esi") d, in("edi") e,
-        lateout("eax") ret,
-        options(nostack)
-    );
-    ret as i32 as i64
+    // The kernel returns -errno in eax; sign-extend the 32-bit result.
+    syscall5_x86(n as usize, a, b, c, d, e) as i32 as i64
 }
 
 // ── Thin wrappers ──────────────────────────────────────────────────────────
