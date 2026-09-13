@@ -2,6 +2,7 @@ pub mod assembler;
 pub mod bytecode;
 pub mod const_pool;
 pub mod deserialize;
+pub mod obfuscate;
 pub mod opcode;
 pub mod opmap;
 pub mod sbc_emitter;
@@ -10,6 +11,7 @@ pub mod serialize;
 
 pub use assembler::Assembler;
 pub use bytecode::{BcCompiler, Bytecode};
+pub use obfuscate::{obfuscate, ObfuscateOptions};
 pub use opcode::Opcode;
 pub use sbc_emitter::SbcEmitter;
 pub use sbc_parser::{SbcArg, SbcInstr, SbcParser};

@@ -70,6 +70,9 @@ Available on `build` and `pack`. Use `--all` to enable every protection at once 
 - XOR encryption of bytecode with random per-build key
 - Per-build opcode shuffling (Fisher-Yates)
 - **Per-build stub variants** — every `--protect` build rebuilds the stub ELF with fresh guard constants and junk-op patterns baked into its machine code, so a handler trace from one build is useless against the next build
+- **Bytecode obfuscation passes (O-LLVM style)** — applied to the bytecode itself before sealing, so the encrypted stream hides a different CFG on every build:
+  - *Bogus control flow* — a seed-chosen subset of jumps is retargeted through decoy blocks of stack-neutral junk appended at the end of the stream; a static CFG sees extra blocks and edges that runtime never distinguishes from real ones
+  - *Instruction substitution* — long pool strings are split into `PushConst(a) PushConst(b) ConcatN(2)` at seed-chosen cut points, so no single pool entry holds a full literal for a static string dump
 - Control-flow flattening + opaque predicates
 - Virtualized dispatch obfuscation
 - **Seeded-header masking (v4)** — the opcode-shuffle and CFF seeds are stored XOR-masked with the stub `.text` CRC; the header alone reveals nothing about the dispatch tables

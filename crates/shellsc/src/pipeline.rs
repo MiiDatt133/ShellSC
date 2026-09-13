@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use shell_ast::ShellError;
-use shell_bc::{assemble_sbc, compile_to_sbc, Bytecode};
+use shell_bc::{assemble_sbc, compile_to_sbc, obfuscate, Bytecode, ObfuscateOptions};
 use shell_ir::{opt, Lowerer};
 use shell_lex::Lexer;
 use shell_pack::Packer;
@@ -30,7 +30,19 @@ pub fn full_pipeline(
     selfdebug: bool,
 ) -> Result<(String, Vec<u8>, Vec<u8>)> {
     let sbc = sh_to_sbc(src)?;
-    let bc = sbc_to_bytecode(&sbc)?;
+    let mut bc = sbc_to_bytecode(&sbc)?;
+    if protect {
+        // O-LLVM-style bytecode passes. Runs before seal() so the
+        // integrity CRC is computed over the obfuscated stream.
+        obfuscate(
+            &mut bc,
+            &ObfuscateOptions {
+                bogus_cf: true,
+                subst: true,
+                seed: shell_pack::variant_seed(),
+            },
+        );
+    }
     let bc_bytes = bc.to_bytes();
     let sc_bytes = if protect {
         let mut opts = shell_pack::ProtectOptions::all();
