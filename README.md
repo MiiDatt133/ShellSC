@@ -8,7 +8,7 @@ Shell script compiler for Android and Linux. Compiles `.sh` scripts into standal
 
 ## Requirements
 
-- A prebuilt binary (see Install), or **Rust 1.70+** to build from source
+- **Rust 1.70+** to build from source
 - On Termux: `pkg install rust`
 
 ## Supported Platforms
@@ -35,8 +35,12 @@ curl -LO https://github.com/MiiDatt133/ShellSC/releases/latest/download/shellsc-
     i686|i386)      echo i686 ;; \
   esac).tar.gz
 tar -xzf shellsc-*.tar.gz
-./shellsc-*/shellsc build script.sh
+cp shellsc-*/shellsc $PREFIX/bin/
+cp -r shellsc-*/stubs $PREFIX/bin/
+shellsc build script.sh
 ```
+
+On PC Linux use `~/.local/bin` instead of `$PREFIX/bin` (make sure it is in `PATH`).
 
 Or build from source:
 
@@ -100,7 +104,7 @@ Available on `build` and `pack`. Use `--all` to enable every protection at once 
 - CRC32 integrity verification
 - Key derivation from stub `.text` — patching one byte of `.text` invalidates the key
 
-Note: a protected build compiles a fresh stub variant (slow on first run, cached per seed afterwards). With a prebuilt shellsc that has no source workspace on the machine, `--protect` uses the bundled stub instead: same encryption and checks, without the per-build stub code variation.
+Note: a protected build compiles a fresh stub variant when a source workspace is present (build from source). With a prebuilt shellsc, `--protect` uses the bundled stub directly: same encryption and checks, without the per-build stub code variation.
 
 ## Structure
 
