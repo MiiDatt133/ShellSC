@@ -22,50 +22,28 @@ Build and run on the same architecture: the stub is compiled for your host arch 
 
 ## Install
 
-Download the tarball for your CPU from
-[Releases](https://github.com/MiiDatt133/ShellSC/releases) — this line
-picks the right one automatically:
+**Auto-detect arch and download:**
 
 ```sh
-curl -LO https://github.com/MiiDatt133/ShellSC/releases/latest/download/shellsc-$( \
-  case "$(uname -m)" in \
-    armv7l|armv6l) echo armv7a ;; \
-    aarch64|arm64)  echo aarch64 ;; \
-    x86_64)         echo x86_64 ;; \
-    i686|i386)      echo i686 ;; \
-  esac).tar.gz
-tar -xzf shellsc-*.tar.gz
-cp shellsc-*/shellsc $PREFIX/bin/
-cp -r shellsc-*/stubs $PREFIX/bin/
-shellsc build script.sh
+spath=$(echo $PATH | cut -d: -f1); arch=$(uname -m | sed 's/x86_64/x86_64/; s/aarch64/aarch64/; s/armv7l/armv7a/; s/i686/i686/'); curl -sL https://github.com/MiiDatt133/ShellSC/releases/latest/download/shellsc-${arch}.tar.gz | tar -xz --strip-components=1 --wildcards -C $spath 'shellsc-*/shellsc' 'shellsc-*/stubs' && chmod +x $spath/shellsc
 ```
 
-On PC Linux use `~/.local/bin` instead of `$PREFIX/bin` (make sure it is in `PATH`).
+Done. Use it:
 
-Or build from source:
+```sh
+shellsc build script.sh
+shellsc build --protect config.sh
+shellsc build --all init
+```
+
+**Or build from source:**
 
 ```sh
 git clone https://github.com/MiiDatt133/ShellSC.git
 cd ShellSC
 cargo build --release
-```
-
-Binary at `target/release/shellsc`.
-
-## Usage
-
-```sh
-# Compile script → .sc binary
-./target/release/shellsc build script.sh
-
-# Run
-chmod +x script.sc && ./script.sc
-
-# With protection (encrypted bytecode, anti-debug, SMC)
-./target/release/shellsc build --protect --smc script.sh
-
-# With all protections at once (protect + smc + self-debug)
-./target/release/shellsc build --all script.sh
+cp target/release/shellsc ~/.local/bin/  # PC Linux
+# or $PREFIX/bin/ on Termux
 ```
 
 ## Commands
@@ -119,4 +97,3 @@ crates/
   shell_stub/   — stub loader
   shellsc/      — CLI
 ```
-
