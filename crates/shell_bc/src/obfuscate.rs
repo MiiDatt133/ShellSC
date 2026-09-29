@@ -3,10 +3,12 @@
 //! machine code):
 //!
 //! 1. **Bogus control flow** — for a seed-chosen subset of unconditional
-//!    `Jmp`s, retarget the jump to a decoy block appended at the end of
-//!    the program. The decoy runs a few stack-neutral junk instructions
-//!    and jumps to the original target. A static CFG analysis sees extra
-//!    blocks and edges indistinguishable from real ones.
+//!    `Jmp`s, retarget the jump to a decoy block inserted directly after
+//!    it. The decoy runs a few stack-neutral junk instructions and jumps
+//!    to the original target. A static CFG analysis sees extra blocks
+//!    and edges indistinguishable from real ones. The block must stay
+//!    inside the Jmp's own `ip_fence` region (pipeline-subshell bodies,
+//!    func calls), so it is inserted inline, not appended at the end.
 //!
 //! 2. **Instruction substitution** — `PushConst(s)` is split into
 //!    `PushConst(a) PushConst(b) ConcatN(2)` at a seed-chosen cut point.
@@ -59,6 +61,11 @@ pub fn obfuscate(bc: &mut Bytecode, opts: &ObfuscateOptions) {
     }
     if opts.bogus_cf {
         bogus_control_flow(bc, opts.seed);
+    }
+    if std::env::var_os("SHELLSC_OBF_DEBUG").is_some() {
+        for (i, ins) in bc.instructions.iter().enumerate() {
+            eprintln!("ins[{i}]: {:?} {}", ins.op, ins.operand);
+        }
     }
 }
 
@@ -140,58 +147,74 @@ fn bogus_control_flow(bc: &mut Bytecode, seed: u32) {
     let instrs = std::mem::take(&mut bc.instructions);
     let pool: ConstPool = std::mem::take(&mut bc.const_pool);
 
-    // Choose which unconditional Jmps get a decoy, then build decoy
-    // blocks at the end. Appending keeps every existing label stable, so
-    // func entries, redir operands and untouched jumps need no relabeling.
-    let chosen: Vec<usize> = instrs
-        .iter()
-        .enumerate()
-        .filter(|(i, ins)| {
-            ins.op == Opcode::Jmp && {
-                // Never decoy the terminal `Jmp` at the very last position —
-                // some tooling assumes the stream ends in Exit.
-                *i + 1 < instrs.len()
-            }
-        })
-        .filter(|_| rng.chance(1, 2))
-        .map(|(i, _)| i)
-        .collect();
-
-    if chosen.is_empty() {
+    // Pick the unconditional Jmps that get a decoy. Never the terminal
+    // `Jmp` at the very last position — some tooling assumes the stream
+    // ends in Exit.
+    let mut chosen = vec![false; instrs.len()];
+    let mut any = false;
+    for (i, ins) in instrs.iter().enumerate() {
+        if ins.op == Opcode::Jmp && i + 1 < instrs.len() && rng.chance(1, 2) {
+            chosen[i] = true;
+            any = true;
+        }
+    }
+    if !any {
         bc.instructions = instrs;
         bc.const_pool = pool;
         return;
     }
 
-    let base = instrs.len() as u32;
-    let mut body: Vec<Instruction> = instrs;
+    // Insert each decoy DIRECTLY AFTER its Jmp, never at the end of the
+    // program: pipeline-subshell bodies and func calls run bounded by
+    // `ip_fence`, and ANY `ip >= fence` breaks out of the region — a
+    // decoy parked past the fence silently killed the enclosing loop
+    // after one iteration. Same-region detours stay under the fence.
+    // Insertion shifts every later index, so a label_map (same scheme
+    // as substitute_consts) remaps jump operands, PipeSubshellBegin
+    // fence ends and func entries afterwards.
+    let mut out: Vec<Instruction> = Vec::with_capacity(instrs.len() + instrs.len() / 2);
+    let mut label_map = vec![0u32; instrs.len()];
+    let mut retargets: Vec<(usize, u32)> = Vec::new(); // (new pos of chosen Jmp, decoy entry)
 
-    // Each decoy block: junk_len save/restore pairs + 1 final Jmp.
-    let junk_len = 2 + (rng.next() % 3) as usize; // 2-4 pairs
-    let block_len = (junk_len * 2 + 1) as u32;
-    let mut entry = base;
-    let mut patch: Vec<(usize, u32, u32)> = Vec::new(); // (jmp_pos, decoy_entry, original_target)
-    for &jmp_pos in &chosen {
-        let original_target = body[jmp_pos].operand;
-        patch.push((jmp_pos, entry, original_target));
-        entry += block_len;
-    }
-
-    // Retarget the chosen jumps to their decoy entries.
-    for &(pos, decoy_entry, _) in &patch {
-        body[pos].operand = decoy_entry;
-    }
-
-    // Append the decoy blocks.
-    for &(_, decoy_entry, target) in &patch {
+    for (old_i, ins) in instrs.into_iter().enumerate() {
+        label_map[old_i] = out.len() as u32;
+        if !chosen[old_i] {
+            out.push(ins);
+            continue;
+        }
+        let target = ins.operand; // old index — remapped below via label_map
+        let jmp_pos = out.len();
+        out.push(ins);
+        let decoy_entry = out.len() as u32;
+        if std::env::var_os("SHELLSC_OBF_DEBUG").is_some() {
+            eprintln!("bcf: Jmp@{old_i} target={target} -> decoy@{decoy_entry}");
+        }
+        // Decoy block: junk_len save/restore pairs + 1 final Jmp back.
+        let junk_len = 2 + (rng.next() % 3) as usize; // 2-4 pairs
         let mut block = decoy_junk(&mut rng, junk_len);
         block.push(Instruction::new(Opcode::Jmp, target));
-        let expected = decoy_entry as usize;
-        debug_assert_eq!(body.len(), expected, "decoy layout mismatch");
-        body.extend(block);
+        out.extend(block);
+        retargets.push((jmp_pos, decoy_entry));
     }
 
-    bc.instructions = body;
+    // Remap every label operand from old- to new-space, then point the
+    // chosen Jmps at their (already new-space) decoy entries.
+    for ins in out.iter_mut() {
+        if matches!(
+            ins.op,
+            Opcode::Jmp | Opcode::JmpIfFail | Opcode::JmpIfOk | Opcode::PipeSubshellBegin
+        ) {
+            ins.operand = label_map[ins.operand as usize];
+        }
+    }
+    for &(pos, decoy_entry) in &retargets {
+        out[pos].operand = decoy_entry;
+    }
+    for f in bc.funcs.iter_mut() {
+        f.entry_ip = label_map[f.entry_ip as usize];
+    }
+
+    bc.instructions = out;
     bc.const_pool = pool;
 }
 
@@ -228,14 +251,45 @@ mod tests {
         bc
     }
 
+    fn sample_fenced() -> Bytecode {
+        // Mimics a `... | while read; do ... done` body: PipeSubshellBegin
+        // fences [1..7), a Jmp inside the body back/forward, code after
+        // the fence must never run in this single-stream replay.
+        let mut bc = Bytecode::default();
+        bc.const_pool.strings.push("a".to_string());
+        bc.const_pool.strings.push("skip".to_string());
+        bc.const_pool.strings.push("b".to_string());
+        bc.const_pool.strings.push("outside".to_string());
+        bc.instructions
+            .push(Instruction::new(Opcode::PipeSubshellBegin, 7)); // 0: fence = 7
+        bc.instructions.push(Instruction::new(Opcode::PushConst, 0)); // 1: a
+        bc.instructions.push(Instruction::new(Opcode::Jmp, 5)); // 2 -> 5 (body back edge)
+        bc.instructions.push(Instruction::new(Opcode::PushConst, 1)); // 3: dead
+        bc.instructions
+            .push(Instruction::no_operand(Opcode::RedirRestore)); // 4: filler
+        bc.instructions.push(Instruction::new(Opcode::PushConst, 2)); // 5: b
+        bc.instructions
+            .push(Instruction::no_operand(Opcode::RedirSave)); // 6: last body slot
+        bc.instructions.push(Instruction::new(Opcode::PushConst, 3)); // 7: outside
+        bc.instructions.push(Instruction::no_operand(Opcode::Exit)); // 8
+        bc
+    }
+
     fn replay(bc: &Bytecode) -> Vec<String> {
         // Simulate the VM stack protocol for PushConst/ConcatN/Jmp and the
         // neutral RedirSave/RedirRestore decoy ops: walk until a non-handled
-        // opcode; Jmp follows its operand.
+        // opcode; Jmp follows its operand. PipeSubshellBegin arms an
+        // ip_fence — crossing it ends the walk, mirroring vm.rs run().
         let mut stack: Vec<String> = vec![];
         let mut ip = 0usize;
         let mut steps = 0;
+        let mut fence: Option<usize> = None;
         while ip < bc.instructions.len() && steps < 100 {
+            if let Some(f) = fence {
+                if ip >= f {
+                    break;
+                }
+            }
             steps += 1;
             let ins = &bc.instructions[ip];
             match ins.op {
@@ -251,6 +305,10 @@ mod tests {
                 }
                 Opcode::Jmp => ip = ins.operand as usize,
                 Opcode::RedirSave | Opcode::RedirRestore => ip += 1,
+                Opcode::PipeSubshellBegin => {
+                    fence = Some(ins.operand as usize);
+                    ip += 1;
+                }
                 Opcode::Exit => break,
                 _ => break,
             }
@@ -316,7 +374,6 @@ mod tests {
     #[test]
     fn bogus_cf_jump_targets_in_range() {
         let mut bc = sample_with_jmp();
-        let exit_pos = bc.instructions.len() - 1;
         obfuscate(
             &mut bc,
             &ObfuscateOptions {
@@ -331,9 +388,36 @@ mod tests {
                 assert!(ins.operand < len, "target {} out of range", ins.operand);
             }
         }
-        // Exit still exists at its original index — decoy blocks are
-        // appended after it and runtime never falls past Exit.
-        assert_eq!(bc.instructions[exit_pos].op, Opcode::Exit);
+        // Exit still exists — decoy blocks are inserted before it and
+        // runtime must reach it when the program ends.
+        assert!(
+            bc.instructions.iter().any(|ins| ins.op == Opcode::Exit),
+            "Exit lost after bcf"
+        );
+    }
+
+    #[test]
+    fn bogus_cf_decoy_stays_inside_ip_fence() {
+        // Regression: appending decoys at the end of the program put them
+        // past any enclosing ip_fence (pipeline-subshell body), so the VM
+        // broke out of the region on the very first detour and the loop
+        // after it ran once. Decoys must stay within the fenced body and
+        // the fence end must shift with the insertion.
+        let want = replay(&sample_fenced());
+        assert_eq!(want, vec!["a", "b"], "fenced sample baseline wrong");
+
+        for seed in [0u32, 1, 7, 0xFFFF_FFFF] {
+            let mut bc = sample_fenced();
+            obfuscate(
+                &mut bc,
+                &ObfuscateOptions {
+                    bogus_cf: true,
+                    subst: false,
+                    seed,
+                },
+            );
+            assert_eq!(replay(&bc), want, "seed {seed} broke fenced body");
+        }
     }
 
     #[test]

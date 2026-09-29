@@ -126,9 +126,11 @@ fn run() -> Result<()> {
                     k.iter_mut().for_each(|b| *b = 0);
                 }
             }
-            if let Some(arg0) = std::env::args().next() {
+            let mut argv = std::env::args();
+            if let Some(arg0) = argv.next() {
                 vm.set_arg0(&arg0);
             }
+            vm.set_positional(&argv.collect::<Vec<_>>());
             let status = vm
                 .run()
                 .map_err(|e| anyhow::anyhow!("running bytecode: {}", e))?;

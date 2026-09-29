@@ -473,11 +473,11 @@ pub fn open(payload: &[u8], text_hash: u32) -> Result<Option<Vec<u8>>, ShellErro
     Ok(Some(body))
 }
 
-/// Number of real opcodes to permute. Shuffle the contiguous 0x01..=0x2A
-/// range (42 opcodes incl. PushArgs, ArrayAssign, ArraySetIndex); Exit at
+/// Number of real opcodes to permute. Shuffle the contiguous 0x01..=0x2D
+/// range (45 opcodes incl. CaseMatchDyn, ProcSubBegin, ProcSubEnd); Exit at
 /// 0xFF stays put because the VM treats it as the terminator.
 pub const OPMAP_LO: u8 = 0x01;
-pub const OPMAP_HI: u8 = 0x2B; // exclusive: covers 0x01..=0x2A (42 opcodes)
+pub const OPMAP_HI: u8 = 0x2E; // exclusive: covers 0x01..=0x2D (45 opcodes)
 pub const OPMAP_SIZE: usize = (OPMAP_HI - OPMAP_LO) as usize;
 
 /// Derive a deterministic permutation of opcode bytes from a seed.

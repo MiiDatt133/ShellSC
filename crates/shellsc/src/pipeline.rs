@@ -34,12 +34,19 @@ pub fn full_pipeline(
     if protect {
         // O-LLVM-style bytecode passes. Runs before seal() so the
         // integrity CRC is computed over the obfuscated stream.
+        let obf_seed = match std::env::var("SHELLSC_OBF_SEED") {
+            Ok(s) => s
+                .parse()
+                .map_err(|_| anyhow::anyhow!("bad SHELLSC_OBF_SEED"))?,
+            Err(_) => shell_pack::variant_seed(),
+        };
+        let pass = std::env::var("SHELLSC_OBF_PASS").unwrap_or_default();
         obfuscate(
             &mut bc,
             &ObfuscateOptions {
-                bogus_cf: true,
-                subst: true,
-                seed: shell_pack::variant_seed(),
+                bogus_cf: pass != "sub",
+                subst: pass != "bcf",
+                seed: obf_seed,
             },
         );
     }
@@ -55,7 +62,12 @@ pub fn full_pipeline(
         // per-build variant entropy).
         let variant_stub = match shell_pack::workspace_root() {
             Ok(ws_root) => {
-                let seed = shell_pack::variant_seed();
+                let seed = match std::env::var("SHELLSC_VARIANT_SEED") {
+                    Ok(s) => s
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("bad SHELLSC_VARIANT_SEED"))?,
+                    Err(_) => shell_pack::variant_seed(),
+                };
                 eprintln!("protect: building stub variant {seed} (first build is slow)…");
                 Some(shell_pack::build_variant_stub(&ws_root, seed).map_err(map_shell_err)?)
             }

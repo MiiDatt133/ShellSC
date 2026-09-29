@@ -106,13 +106,13 @@ pub struct Vm {
     /// is transformed through a seeded bijection before the dispatch match,
     /// so a static disassembler cannot map match arms back to opcodes.
     cff_active: bool,
-    /// Per-build permutation of opcode bytes 0x01..=0x2A applied at dispatch
+    /// Per-build permutation of opcode bytes 0x01..=0x2D applied at dispatch
     /// time: the decoded opcode is permuted before the match, so a memory
     /// dump of the bytecode does not directly reveal which handler runs.
-    cff_decode: [u8; 42],
+    cff_decode: [u8; 45],
     /// Inverse of cff_decode: slot_decode[slot] = original opcode index.
     /// Used for virtualized dispatch verification.
-    slot_decode: [u8; 42],
+    slot_decode: [u8; 45],
     /// Per-build key for virtualized dispatch XOR verification.
     virt_key: u32,
     /// Opaque-predicate params (always-true guards derived from the protect
@@ -167,8 +167,8 @@ impl Vm {
             exec_terminated: false,
             for_exit_status: None,
             cff_active: false,
-            cff_decode: [0; 42],
-            slot_decode: [0; 42],
+            cff_decode: [0; 45],
+            slot_decode: [0; 45],
             virt_key: 0,
             opaque_p1: 0,
             opaque_p2: 0,
@@ -188,9 +188,9 @@ impl Vm {
         // Poly VM: the seed also picks which predicate/decoy shapes this
         // build's dispatch guard uses.
         self.poly_variant = (cff_seed & 3) as u8;
-        // Fisher-Yates permutation of opcode bytes 0x01..=0x2A, derived
+        // Fisher-Yates permutation of opcode bytes 0x01..=0x2D, derived
         // deterministically from the seed so the stub and VM agree.
-        let mut perm: [u8; 42] = (1u8..=42).collect::<Vec<u8>>().try_into().unwrap();
+        let mut perm: [u8; 45] = (1u8..=45).collect::<Vec<u8>>().try_into().unwrap();
         let mut rng_state = (cff_seed as u32).wrapping_mul(CFF_PERM_MULT) | 1;
         let mut i = perm.len();
         while i > 1 {
@@ -203,7 +203,7 @@ impl Vm {
         }
         self.cff_decode = perm;
         // Build inverse permutation for virtualized dispatch verification.
-        let mut inv = [0u8; 42];
+        let mut inv = [0u8; 45];
         for (i, &v) in perm.iter().enumerate() {
             inv[(v - 1) as usize] = i as u8;
         }
@@ -554,6 +554,11 @@ impl Vm {
     /// Set `$0` (the shell/script name) from the process argv[0].
     pub fn set_arg0(&mut self, arg0: &str) {
         self.env.set("0", arg0);
+    }
+
+    /// Set positional parameters `$1..$N` from the process argv[1..].
+    pub fn set_positional(&mut self, args: &[String]) {
+        self.env.set_positional(args);
     }
 
     pub fn run(&mut self) -> Result<ExitStatus, ShellError> {
@@ -1187,6 +1192,12 @@ impl Vm {
                         // single field must be the TRIMMED field — `$(echo $s)`
                         // with `s=" spaced "` yields "spaced", not " spaced ".
                         let fields = self.split_fields_ifs(&pattern);
+                        // An unquoted expansion yielding zero fields removes
+                        // the word entirely (bash word removal): record the
+                        // deficit so argc shrinks instead of underflowing.
+                        if fields.is_empty() {
+                            self.glob_deficit += 1;
+                        }
                         let extra = fields.len().saturating_sub(1);
                         for f in fields {
                             self.stack.push_str(f);
@@ -1915,12 +1926,13 @@ impl Vm {
         use std::process::{Command, Stdio};
 
         let (stdin_bytes, redirs) = redirs.split_stdin()?;
+        // Feed the child a COPY of the remaining piped stdin. Taking the
+        // cursor would empty it: most children never read stdin, and a
+        // later `read` would then block forever on the real fd 0.
         let stdin_data = stdin_bytes.or_else(|| {
-            self.pending_stdin.take().map(|mut c| {
-                let mut buf = Vec::new();
-                use std::io::Read;
-                let _ = c.read_to_end(&mut buf);
-                buf
+            self.pending_stdin.as_ref().map(|c| {
+                let pos = c.position() as usize;
+                c.get_ref()[pos..].to_vec()
             })
         });
         let mut cmd = Command::new(&argv[0]);
