@@ -21,6 +21,7 @@ fn eval_test(args: &[&str]) -> bool {
             "-f" => std::path::Path::new(val).is_file(),
             "-d" => std::path::Path::new(val).is_dir(),
             "-e" => std::path::Path::new(val).exists(),
+            "-s" => std::fs::metadata(val).map(|m| m.len() > 0).unwrap_or(false),
             "-z" => val.is_empty(),
             "-n" => !val.is_empty(),
             "-r" | "-w" | "-x" => std::path::Path::new(val).exists(),
@@ -46,4 +47,27 @@ fn eval_test(args: &[&str]) -> bool {
 
 fn parse_i64(s: &str) -> i64 {
     s.parse().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::eval_test;
+
+    #[test]
+    fn s_requires_existing_nonempty_file() {
+        let dir = std::env::temp_dir();
+        let empty = dir.join("shellsc_test_s_empty");
+        let filled = dir.join("shellsc_test_s_filled");
+        std::fs::write(&empty, b"").unwrap();
+        std::fs::write(&filled, b"x").unwrap();
+        let e = empty.to_str().unwrap();
+        let f = filled.to_str().unwrap();
+
+        assert!(eval_test(&["-s", f]));
+        assert!(!eval_test(&["-s", e]));
+        assert!(!eval_test(&["-s", "/no/such/file_xyz"]));
+
+        let _ = std::fs::remove_file(&empty);
+        let _ = std::fs::remove_file(&filled);
+    }
 }
