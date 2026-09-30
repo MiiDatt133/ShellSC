@@ -48,6 +48,15 @@ impl<'a> Lexer<'a> {
         }
 
         self.skip_whitespace_horizontal();
+        // Line continuation between tokens: `\` + newline is removed
+        // before tokenisation (bash joins the logical line first), so
+        // `one \<nl> two` must yield Word(one) Word(two), never an empty
+        // Word at the continuation point.
+        while self.cursor.peek() == Some('\\') && self.cursor.peek2() == Some('\n') {
+            self.cursor.advance(); // backslash
+            self.cursor.advance(); // newline
+            self.skip_whitespace_horizontal();
+        }
 
         let start = self.cursor.pos();
         let start_ln = self.cursor.line;
@@ -294,16 +303,20 @@ impl<'a> Lexer<'a> {
                 Some('\\') => {
                     self.cursor.advance();
                     match self.cursor.peek() {
-                        Some('"') | Some('\\') | Some('$') | Some('`') | Some('\n') => {
+                        // Line continuation inside dquotes: `\` + newline
+                        // is removed entirely — the logical line joins and
+                        // no backslash remains (bash behaviour).
+                        Some('\n') => {
+                            self.cursor.advance();
+                        }
+                        Some('"') | Some('\\') | Some('$') | Some('`') => {
                             // Preserve the backslash so the parser can
                             // distinguish escaped quotes (`\"`) from the
                             // closing delimiter and keep `\$/\`` as literal
                             // triggers rather than expansions.
                             s.push('\\');
                             if let Some(c) = self.cursor.advance() {
-                                if c != '\n' {
-                                    s.push(c);
-                                }
+                                s.push(c);
                             }
                         }
                         _ => {
