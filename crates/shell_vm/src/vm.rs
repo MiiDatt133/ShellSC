@@ -2764,7 +2764,7 @@ fn expand_glob_pattern(pattern: &str) -> Vec<String> {
         glob_walk(
             std::path::Path::new("/"),
             &pattern[1..],
-            "",
+            "/",
             false,
             &mut out,
         );
@@ -2773,6 +2773,17 @@ fn expand_glob_pattern(pattern: &str) -> Vec<String> {
     }
     out.sort();
     out
+}
+
+/// Join a path prefix with the next segment, preserving an absolute root.
+fn glob_join(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else if prefix.ends_with('/') {
+        format!("{}{}", prefix, name)
+    } else {
+        format!("{}/{}", prefix, name)
+    }
 }
 
 /// Recursive glob walker.
@@ -2788,10 +2799,47 @@ fn glob_walk(
     strip_dot: bool,
     out: &mut Vec<String>,
 ) {
+    // Trailing `/` in the pattern: the match is the directory itself
+    // (`*/` → every directory, with the slash kept).
+    if pattern.is_empty() {
+        if !prefix.is_empty() && dir.is_dir() {
+            let mut s = prefix.to_string();
+            if !s.ends_with('/') {
+                s.push('/');
+            }
+            out.push(s);
+        }
+        return;
+    }
+
     let (seg, tail) = match pattern.find('/') {
         Some(i) => (&pattern[..i], Some(&pattern[i + 1..])),
         None => (pattern, None),
     };
+
+    // Literal segment: descend directly without listing the parent.
+    // Some parents are traverse-only (e.g. /data on Android is `--x`,
+    // not listable) — read_dir there would fail and drop matches that
+    // stat-based walking finds. Listing is only needed for magic segs.
+    if !has_glob_chars(seg) {
+        let full = glob_join(prefix, seg);
+        match tail {
+            None => {
+                // Only reachable when an ancestor segment had magic:
+                // the final literal component must exist (bash stats it).
+                if dir.join(seg).exists() {
+                    let s = if strip_dot && full.starts_with("./") {
+                        full[2..].to_string()
+                    } else {
+                        full
+                    };
+                    out.push(s);
+                }
+            }
+            Some(rest) => glob_walk(&dir.join(seg), rest, &full, strip_dot, out),
+        }
+        return;
+    }
 
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -2813,11 +2861,7 @@ fn glob_walk(
         }
 
         // Build the output path string for this match
-        let full: String = if prefix.is_empty() {
-            name.into_owned()
-        } else {
-            format!("{}/{}", prefix, name)
-        };
+        let full = glob_join(prefix, &name);
 
         match tail {
             // No more segments: this is a leaf match
