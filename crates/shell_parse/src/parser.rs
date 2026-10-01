@@ -939,6 +939,9 @@ impl Parser {
                         }
                     }
                     parts.push(WordPart::CmdSub(self.parse_inner(&inner, span)?));
+                    // Unquoted command substitution is subject to field
+                    // splitting (and pathname expansion) like $var.
+                    may_glob = true;
                 }
                 '$' => {
                     match chars.peek().map(|&(_, c)| c) {
@@ -956,6 +959,9 @@ impl Parser {
                                 // Command substitution: $( cmd )
                                 let inner = read_cmdsub_body(&mut chars);
                                 parts.push(WordPart::CmdSub(self.parse_inner(&inner, span)?));
+                                // Unquoted command substitution is subject to
+                                // field splitting (and pathname expansion).
+                                may_glob = true;
                             }
                         }
                         Some('{') => {

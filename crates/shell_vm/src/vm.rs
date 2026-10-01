@@ -68,6 +68,10 @@ pub struct Vm {
     /// Slots withheld by PushArgs when there are zero positionals — the
     /// compiled 1-slot assumption must be undone by the next consumer.
     glob_deficit: usize,
+    /// A redirect target expanded to 0 or >1 fields ("ambiguous redirect"):
+    /// set at DynRedir, consumed by the statement's exec op (command must
+    /// not run), cleared at statement/compound boundaries.
+    redir_failed: bool,
     /// Stdin data piped from a previous pipeline stage (consumed line-by-line by `read`).
     pending_stdin: Option<std::io::Cursor<Vec<u8>>>,
     /// Background function-call child VMs — `wait` joins them all.
@@ -150,6 +154,7 @@ impl Vm {
             subshell_envs: vec![],
             glob_surplus: 0,
             glob_deficit: 0,
+            redir_failed: false,
             pending_stdin: None,
             bg_handles: vec![],
             bg_chain: None,
@@ -680,6 +685,10 @@ impl Vm {
                     let name = self.pool_str(instr.operand)?;
                     let value = self.stack.pop()?.into_string();
                     self.env.set(name, value);
+                    // Assignment-only statements have no exec op to consume
+                    // an ambiguous-redirect flag — clear it here so it can't
+                    // skip a later innocent command.
+                    self.redir_failed = false;
                 }
                 Opcode::ArrayAssign => {
                     // Operand: [append:1][local:1][count:7][pool_idx:24].
@@ -700,6 +709,7 @@ impl Vm {
                         (false, true) => self.env.set_array_local(&name, items),
                         (false, false) => self.env.set_array(&name, items),
                     }
+                    self.redir_failed = false;
                 }
                 Opcode::ArraySetIndex => {
                     // Stack: [index, value] — value on top.
@@ -708,6 +718,7 @@ impl Vm {
                     let idx_raw = self.stack.pop()?.into_string();
                     let idx = self.eval_array_index(&name, &idx_raw)?;
                     self.env.array_set_index(&name, idx, value);
+                    self.redir_failed = false;
                 }
 
                 Opcode::Builtin => {
@@ -720,6 +731,15 @@ impl Vm {
                     let argc = (argc_raw + self.glob_surplus).saturating_sub(self.glob_deficit);
                     self.glob_surplus = 0;
                     self.glob_deficit = 0;
+
+                    if std::mem::take(&mut self.redir_failed) && self.pipeline_expected == 0 {
+                        // Ambiguous redirect: drain the argv the compiled code
+                        // still pushed, drop the statement's redirects, leave
+                        // the FAIL status from DynRedir.
+                        let _ = self.pop_n(argc)?;
+                        self.drop_stmt_redirs();
+                        continue;
+                    }
 
                     if self.pipeline_expected > 0 {
                         let args = self.pop_builtin_args(id, argc)?;
@@ -802,6 +822,12 @@ impl Vm {
                     self.glob_surplus = 0;
                     self.glob_deficit = 0;
                     let argv = self.pop_n(n)?;
+                    if std::mem::take(&mut self.redir_failed) && self.pipeline_expected == 0 {
+                        // Ambiguous redirect: argv drained, leave the FAIL
+                        // status from DynRedir.
+                        self.drop_stmt_redirs();
+                        continue;
+                    }
                     if self.pipeline_expected > 0 {
                         let redirs =
                             RedirSet::new(std::mem::take(&mut self.pipeline_pending_redirs));
@@ -860,6 +886,10 @@ impl Vm {
                     self.glob_surplus = 0;
                     self.glob_deficit = 0;
                     let argv = self.pop_n(n)?;
+                    if std::mem::take(&mut self.redir_failed) && self.pipeline_expected == 0 {
+                        self.drop_stmt_redirs();
+                        continue;
+                    }
                     let redirs = self.take_redirs();
                     // Shell function in background: run it in a detached
                     // child VM (bash semantics — `fn &` runs the function
@@ -1045,6 +1075,25 @@ impl Vm {
                 Opcode::DynRedir => {
                     let kind_byte = (instr.operand >> 24) as u8;
                     let fd = instr.operand & 0x00FF_FFFF;
+                    // bash: the redirect word is field-split, and 0 or >1
+                    // fields is an "ambiguous redirect" — fail the statement.
+                    if self.glob_surplus > 0 || self.glob_deficit > 0 {
+                        let extra = self.glob_surplus;
+                        self.glob_surplus = 0;
+                        self.glob_deficit = 0;
+                        if extra > 0 {
+                            // Drain the n-1 surplus fields plus the popped top.
+                            let _ = self.pop_n(extra + 1)?;
+                        }
+                        self.redir_failed = true;
+                        self.update_status(ExitStatus::from_code(1));
+                        self.write_to_fd_inner(
+                            2,
+                            b"shellsc: ambiguous redirect\n",
+                            &mut Vec::new(),
+                        );
+                        continue;
+                    }
                     let path = self.stack.pop()?.into_string();
                     let spec = if kind_byte == 6 {
                         RedirSpec {
@@ -1135,6 +1184,10 @@ impl Vm {
                     } else {
                         self.pending_redirs.clear();
                     }
+                    // Compound statement ended without reaching an exec op
+                    // (e.g. skipped loop body) — don't carry an ambiguous-
+                    // redirect flag into the next statement.
+                    self.redir_failed = false;
                 }
 
                 // ── Pipeline subshell stage ───────────────────────────────────
@@ -1771,11 +1824,20 @@ impl Vm {
             return;
         }
         if let (RedirKind::Out, RedirTargetSpec::File(path)) = (&spec.kind, &spec.target) {
-            let _ = std::fs::OpenOptions::new()
+            if let Err(e) = std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .open(path);
+                .open(path)
+            {
+                // bash: a redirection failure aborts the statement ($?=1,
+                // message to stderr, command does not run).
+                self.redir_failed = true;
+                self.update_status(ExitStatus::from_code(1));
+                let msg = format!("shellsc: {}: {}\n", path, e);
+                self.write_to_fd_inner(2, msg.as_bytes(), &mut Vec::new());
+                return;
+            }
         }
         self.pending_redirs.push(spec);
     }
@@ -2457,6 +2519,20 @@ impl Vm {
             .into_iter()
             .map(|v| v.into_string())
             .collect())
+    }
+
+    /// Statement-level redirects die with the statement — used when the
+    /// statement is abandoned before its exec op (ambiguous redirect).
+    fn drop_stmt_redirs(&mut self) {
+        if self.redir_stack.is_empty() {
+            match self.call_stack.last() {
+                None => self.pending_redirs.clear(),
+                Some(frame) => {
+                    let base = frame.base_redirs.clone();
+                    self.pending_redirs = base;
+                }
+            }
+        }
     }
 
     fn take_redirs(&mut self) -> RedirSet {
