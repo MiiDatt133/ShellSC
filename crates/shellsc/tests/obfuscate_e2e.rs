@@ -76,13 +76,15 @@ fn obfuscated_runs_match_original_semantics() {
     for (src, _want_rc) in SOURCES {
         let orig = build_bytecode(src);
         let want = run_vm(orig.clone());
-        for seed in [0u32, 1, 7, 42, 0x9E37_79B9, 0xFFFF_FFFF] {
+        for seed in [0u32, 1, 4, 7, 42, 0x9E37_79B9, 0xFFFF_FFFF] {
             let mut bc = build_bytecode(src);
             obfuscate(
                 &mut bc,
                 &ObfuscateOptions {
                     bogus_cf: true,
                     subst: true,
+                    condneg: true,
+                    arith_neutral: true,
                     seed,
                 },
             );
@@ -108,6 +110,8 @@ fn obfuscation_changes_the_stream() {
         &ObfuscateOptions {
             bogus_cf: true,
             subst: true,
+            condneg: true,
+            arith_neutral: true,
             seed: 1234,
         },
     );
@@ -128,6 +132,8 @@ fn seeds_produce_different_layouts() {
             &ObfuscateOptions {
                 bogus_cf: true,
                 subst: true,
+                condneg: true,
+                arith_neutral: true,
                 seed,
             },
         );

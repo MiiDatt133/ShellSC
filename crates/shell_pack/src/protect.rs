@@ -344,6 +344,24 @@ pub fn text_crc_from_elf(elf_bytes: &[u8]) -> Result<u32, ShellError> {
 
 // ── Seal / open ──────────────────────────────────────────────────────────────
 
+/// Per-block CFI checksum table over the plaintext instruction rows:
+/// CRC32 of every `shell_bc::opmap::CFI_BLOCK` consecutive 5-byte rows.
+/// The runtime verifier (`shell_vm::smc`) recomputes the same fingerprint
+/// row-by-row as it decodes; any divergence means the stream was patched.
+fn cfi_build_table(bc_bytes: &[u8]) -> Result<Vec<u32>, ShellError> {
+    let offsets = shell_bc::opmap::instruction_offsets(bc_bytes)?;
+    Ok(offsets
+        .chunks(shell_bc::opmap::CFI_BLOCK)
+        .map(|chunk| {
+            let mut bytes = Vec::with_capacity(chunk.len() * 5);
+            for &off in chunk {
+                bytes.extend_from_slice(&bc_bytes[off..off + 5]);
+            }
+            crc32(&bytes)
+        })
+        .collect())
+}
+
 /// Seal the plaintext bytecode into a protected `.shellsc` payload.
 /// `text_hash` is the CRC32 of the ELF stub's .text section; when encrypting,
 /// the key stored in the header is XOR-masked with this hash so the real key
@@ -358,6 +376,21 @@ pub fn seal(bc_bytes: &[u8], opts: ProtectOptions, text_hash: u32) -> Result<Vec
     if opts.opmap {
         let perm = opcode_permutation(seed);
         apply_opmap(&mut body, &perm)?;
+    }
+
+    // CFI table sits AHEAD of the shuffled stream (never inside the
+    // instruction region the opmap walk sees) and is encrypted together
+    // with it. Header.orig_len covers the SHBC stream only — open()
+    // strips the table before the length check.
+    if opts.smc {
+        let table = cfi_build_table(bc_bytes)?;
+        let mut framed = Vec::with_capacity(4 + table.len() * 4 + body.len());
+        framed.extend_from_slice(&(table.len() as u32).to_le_bytes());
+        for c in &table {
+            framed.extend_from_slice(&c.to_le_bytes());
+        }
+        framed.append(&mut body);
+        body = framed;
     }
 
     let crc = crc32(bc_bytes);
@@ -434,9 +467,13 @@ pub fn derive_seeds(header: &ProtectHeader, version: u8, text_hash: u32) -> Deri
 }
 
 /// Open a protected payload: returns the decrypted, opcode-restored
-/// bytecode bytes. `text_hash` is the CRC32 of the ELF stub's .text section,
-/// used to unmask the key stored in the header (version >= 3).
-pub fn open(payload: &[u8], text_hash: u32) -> Result<Option<Vec<u8>>, ShellError> {
+/// bytecode bytes plus the CFI block table when SMC protection sealed one.
+/// `text_hash` is the CRC32 of the ELF stub's .text section, used to
+/// unmask the key stored in the header (version >= 3).
+pub fn open(
+    payload: &[u8],
+    text_hash: u32,
+) -> Result<Option<(Vec<u8>, Option<Vec<u32>>)>, ShellError> {
     if !is_protected(payload) {
         return Ok(None);
     }
@@ -452,6 +489,32 @@ pub fn open(payload: &[u8], text_hash: u32) -> Result<Option<Vec<u8>>, ShellErro
         };
         xor_crypt(&real_key, &mut body);
     }
+
+    // CFI table frames the SHBC stream: [num_blocks u32 LE][crc32 * n].
+    // Strip it before the opmap revert / CRC / length checks — those all
+    // operate on the bare bytecode stream.
+    let cfi = if header.flags & FLAG_SMC != 0 {
+        if body.len() < 4 {
+            return Err(ShellError::IoError(
+                "binary tampered: cfi table truncated".into(),
+            ));
+        }
+        let n = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+        if n > (body.len() - 4) / 4 {
+            return Err(ShellError::IoError(
+                "binary tampered: cfi table truncated".into(),
+            ));
+        }
+        let tlen = 4 + n * 4;
+        let table = body[4..tlen]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        body.drain(0..tlen);
+        Some(table)
+    } else {
+        None
+    };
 
     let seeds = derive_seeds(&header, version, text_hash);
 
@@ -470,7 +533,7 @@ pub fn open(payload: &[u8], text_hash: u32) -> Result<Option<Vec<u8>>, ShellErro
     if body.len() != header.orig_len as usize {
         return Err(ShellError::IoError("bytecode length mismatch".into()));
     }
-    Ok(Some(body))
+    Ok(Some((body, cfi)))
 }
 
 /// Number of real opcodes to permute. Shuffle the contiguous 0x01..=0x2D
@@ -656,7 +719,7 @@ mod tests {
             if opts.encrypt {
                 assert!(!sealed[HEADER_LEN..].starts_with(b"SHBC"));
             }
-            let opened = open(&sealed, 0).unwrap().unwrap();
+            let (opened, _cfi) = open(&sealed, 0).unwrap().unwrap();
             assert_eq!(opened, bc_bytes);
         }
     }
@@ -682,7 +745,7 @@ mod tests {
         let sealed = seal(&bc_bytes, opts, 0).unwrap();
         // Ciphertext == shuffled plaintext (no XOR).
         assert!(sealed[HEADER_LEN..].starts_with(b"SHBC"));
-        let opened = open(&sealed, 0).unwrap().unwrap();
+        let (opened, _cfi) = open(&sealed, 0).unwrap().unwrap();
         assert_eq!(opened, bc_bytes);
     }
 
@@ -715,7 +778,7 @@ mod tests {
         assert_ne!(header.cff_seed, derived_cff, "cff seed stored unmasked");
         // Round-trip through open() with the correct text_crc recovers the
         // original bytecode — proving the unmask derives the true seeds.
-        let opened = open(&sealed, text_crc).unwrap().unwrap();
+        let (opened, _cfi) = open(&sealed, text_crc).unwrap().unwrap();
         assert_eq!(opened, bc_bytes);
     }
 
@@ -727,5 +790,51 @@ mod tests {
         // wrong permutation → CRC mismatch → tamper error.
         let err = open(&sealed, 0xBBBB_0002).err().unwrap().to_string();
         assert!(err.contains("tampered"), "{err}");
+    }
+
+    #[test]
+    fn cfi_table_roundtrip_when_smc() {
+        let bc_bytes = sample_shbc();
+        let sealed = seal(&bc_bytes, ProtectOptions::all(), 0).unwrap();
+        let (opened, cfi) = open(&sealed, 0).unwrap().unwrap();
+        assert_eq!(opened, bc_bytes);
+        let cfi = cfi.expect("smc seal must produce a CFI table");
+        // 4 instructions -> 1 block; entry = CRC32 of the raw rows.
+        assert_eq!(cfi.len(), 1);
+        let offsets = shell_bc::opmap::instruction_offsets(&bc_bytes).unwrap();
+        let mut rows = Vec::new();
+        for off in offsets {
+            rows.extend_from_slice(&bc_bytes[off..off + 5]);
+        }
+        assert_eq!(cfi[0], crc32(&rows), "build table must match row CRC");
+    }
+
+    #[test]
+    fn no_cfi_table_without_smc() {
+        let bc_bytes = sample_shbc();
+        let opts = ProtectOptions {
+            smc: false,
+            ..ProtectOptions::all()
+        };
+        let sealed = seal(&bc_bytes, opts, 0).unwrap();
+        let (_, cfi) = open(&sealed, 0).unwrap().unwrap();
+        assert!(cfi.is_none());
+    }
+
+    #[test]
+    fn cfi_frame_tamper_fails_closed() {
+        // Unencrypted payload: the CFI frame is plaintext, so patch
+        // num_blocks directly — open() must refuse, never bypass.
+        let bc_bytes = sample_shbc();
+        let opts = ProtectOptions {
+            smc: true,
+            encrypt: false,
+            opmap: false,
+            ..ProtectOptions::all()
+        };
+        let mut sealed = seal(&bc_bytes, opts, 0).unwrap();
+        sealed[HEADER_LEN] ^= 0xFF; // num_blocks low byte: 1 -> 254
+        let err = open(&sealed, 0).err().unwrap().to_string();
+        assert!(err.contains("cfi"), "{err}");
     }
 }

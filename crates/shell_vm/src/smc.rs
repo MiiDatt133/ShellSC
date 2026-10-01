@@ -23,6 +23,13 @@
 //!    the build key. Two builds of the same script not only use different
 //!    keys, they run structurally different keystream generators; an
 //!    unpacker must implement all shapes.
+//!
+//! 4. **Per-block CFI checksum** — every 32 decoded instruction rows are
+//!    fingerprinted with a CRC32 that must match a table sealed into the
+//!    payload at build time. Patching an encrypted row (or the plaintext
+//!    window between unseal and reseal) makes the fingerprint diverge;
+//!    on mismatch the decode chain is poisoned and the stream reports
+//!    end-of-program instead of executing tampered code.
 
 /// A single `[op:1][operand:4]` instruction in its raw serialized form.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +147,42 @@ fn data_keystream(key: [u8; 16], salt: u32, idx: usize) -> [u8; 5] {
     ks
 }
 
+/// Rows per CFI block — shared constant lives in `shell_bc::opmap`.
+pub use shell_bc::opmap::CFI_BLOCK;
+
+/// IEEE802.3 CRC32 step (bitwise, no table) — same polynomial/init as
+/// `shell_pack::protect::crc32`, fed incrementally. Callers start at
+/// `0xFFFF_FFFF` and xor the final value with `0xFFFF_FFFF` per block.
+fn crc_update(mut crc: u32, bytes: &[u8]) -> u32 {
+    for &b in bytes {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                0xEDB8_8320 ^ (crc >> 1)
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
+}
+
+/// Build the per-block CFI table over plaintext instruction rows. Mirrors
+/// the table `shell_pack::protect::seal` computes from the serialized
+/// stream: same block size, same CRC32.
+fn cfi_table_of(instrs: &[RawInstr]) -> Vec<u32> {
+    instrs
+        .chunks(CFI_BLOCK)
+        .map(|chunk| {
+            let mut fp = 0xFFFF_FFFFu32;
+            for r in chunk {
+                fp = crc_update(fp, &r.to_bytes());
+            }
+            fp ^ 0xFFFF_FFFF
+        })
+        .collect()
+}
+
 /// Encrypted instruction stream + decrypted-on-demand pool/redirs/funcs.
 #[derive(Clone)]
 pub struct SmcStream {
@@ -162,6 +205,12 @@ pub struct SmcStream {
     pub redirs: Vec<SmcRedir>,
     /// Function entries with names encrypted.
     pub funcs: Vec<SmcFunc>,
+    /// Per-block CRC32 of the plaintext rows (build-time sealed table).
+    cfi_table: Vec<u32>,
+    /// Running CRC of the current block, init IEEE802.3.
+    cfi_fp: u32,
+    /// Rows already fed into `cfi_fp`.
+    cfi_in_block: u16,
 }
 
 /// Mirror of `shell_bc::bytecode::RedirEntry` with string payloads held
@@ -197,6 +246,10 @@ impl SmcStream {
     /// the same salt must be re-supplied on decode via `enable_smc`. For
     /// the internal seal→unseal round-trip (eval splicing) any value
     /// works as long as it matches.
+    ///
+    /// `cfi` is the build-time per-block checksum table from the protect
+    /// payload; pass `None` (eval splice) to derive a fresh table from the
+    /// rows being sealed — verification is active either way.
     pub fn seal(
         key: [u8; 16],
         salt: u32,
@@ -204,6 +257,7 @@ impl SmcStream {
         pool: Vec<String>,
         redirs: Vec<SmcRedir>,
         funcs: Vec<SmcFunc>,
+        cfi: Option<Vec<u32>>,
     ) -> Self {
         let shape = shape_of(key);
         // Seal the instruction chain sequentially: state after each row
@@ -272,6 +326,9 @@ impl SmcStream {
             pool: enc_pool,
             redirs: enc_redirs,
             funcs: enc_funcs,
+            cfi_table: cfi.unwrap_or_else(|| cfi_table_of(&instrs)),
+            cfi_fp: 0xFFFF_FFFF,
+            cfi_in_block: 0,
         }
     }
 
@@ -280,6 +337,30 @@ impl SmcStream {
     pub fn rewind(&mut self) {
         self.chain = chain_init(self.key);
         self.chain_pos = 0;
+        self.cfi_fp = 0xFFFF_FFFF;
+        self.cfi_in_block = 0;
+    }
+
+    /// Feed one decoded row into the block fingerprint. Returns false on
+    /// a block-boundary mismatch (chain poisoned by the caller's side
+    /// effect below — poison happens here so both decode paths are safe).
+    #[must_use]
+    fn cfi_feed(&mut self, row: &[u8; 5], idx: usize) -> bool {
+        self.cfi_fp = crc_update(self.cfi_fp, row);
+        self.cfi_in_block += 1;
+        if self.cfi_in_block as usize == CFI_BLOCK {
+            let ok =
+                self.cfi_table.get(idx / CFI_BLOCK).copied() == Some(self.cfi_fp ^ 0xFFFF_FFFF);
+            self.cfi_fp = 0xFFFF_FFFF;
+            self.cfi_in_block = 0;
+            if !ok {
+                // Tamper detected: poison the chain so every later decode
+                // is garbage, then signal end-of-stream to the VM.
+                self.chain ^= 0xDEAD_BEEF;
+                return false;
+            }
+        }
+        true
     }
 
     pub fn instr_len(&self) -> usize {
@@ -313,6 +394,9 @@ impl SmcStream {
                 b[j] ^= k;
             }
             self.chain = chain_advance(shape, self.chain, &b);
+            if !self.cfi_feed(&b, self.chain_pos) {
+                return None;
+            }
             self.chain_pos += 1;
         }
         if self.chain_pos != ip {
@@ -326,6 +410,9 @@ impl SmcStream {
         }
         let raw = RawInstr::from_bytes(&b);
         self.chain = chain_advance(shape, self.chain, &b);
+        if !self.cfi_feed(&b, ip) {
+            return None;
+        }
         self.chain_pos += 1;
         Some(raw)
     }
@@ -505,7 +592,7 @@ mod tests {
     #[test]
     fn instr_roundtrip_per_position() {
         let (instrs, pool, redirs, funcs) = sample();
-        let mut stream = SmcStream::seal([7u8; 16], 0, instrs.clone(), pool, redirs, funcs);
+        let mut stream = SmcStream::seal([7u8; 16], 0, instrs.clone(), pool, redirs, funcs, None);
         for (i, want) in instrs.iter().enumerate() {
             assert_eq!(&stream.instr_at(i).unwrap(), want);
         }
@@ -517,7 +604,7 @@ mod tests {
         // The dispatch loop decodes in order — the chain must serve the
         // full sequence without needing rewind.
         let (instrs, pool, redirs, funcs) = sample();
-        let mut stream = SmcStream::seal([11u8; 16], 42, instrs.clone(), pool, redirs, funcs);
+        let mut stream = SmcStream::seal([11u8; 16], 42, instrs.clone(), pool, redirs, funcs, None);
         for (i, want) in instrs.iter().enumerate() {
             assert_eq!(&stream.instr_at(i).unwrap(), want);
         }
@@ -527,7 +614,7 @@ mod tests {
     fn backward_jump_replays_chain() {
         // Loop pattern: decode 0,1,2 then jump back to 1.
         let (instrs, pool, redirs, funcs) = sample();
-        let mut stream = SmcStream::seal([5u8; 16], 9, instrs.clone(), pool, redirs, funcs);
+        let mut stream = SmcStream::seal([5u8; 16], 9, instrs.clone(), pool, redirs, funcs, None);
         assert_eq!(&stream.instr_at(0).unwrap(), &instrs[0]);
         assert_eq!(&stream.instr_at(1).unwrap(), &instrs[1]);
         assert_eq!(&stream.instr_at(2).unwrap(), &instrs[2]);
@@ -540,7 +627,7 @@ mod tests {
     #[test]
     fn same_instr_different_ciphertext() {
         let (instrs, pool, redirs, funcs) = sample();
-        let stream = SmcStream::seal([7u8; 16], 0, instrs, pool, redirs, funcs);
+        let stream = SmcStream::seal([7u8; 16], 0, instrs, pool, redirs, funcs, None);
         // Identical instructions at positions 0 and 2 must not encrypt alike.
         assert_ne!(stream.instrs[0], stream.instrs[2]);
     }
@@ -558,7 +645,7 @@ mod tests {
         )
         .unwrap();
         let want_func = String::from_utf8(funcs[0].name.clone()).unwrap();
-        let stream = SmcStream::seal([3u8; 16], 77, instrs, pool, redirs, funcs);
+        let stream = SmcStream::seal([3u8; 16], 77, instrs, pool, redirs, funcs, None);
         for (i, want) in want_pool.iter().enumerate() {
             assert_eq!(&stream.pool_get(i as u32).unwrap(), want);
         }
@@ -573,7 +660,7 @@ mod tests {
         // at seal time decrypts pool data into garbage. A static unpacker
         // that knows the key but not the runtime salt fails here.
         let (instrs, pool, redirs, funcs) = sample();
-        let stream = SmcStream::seal([3u8; 16], 111, instrs, pool.clone(), redirs, funcs);
+        let stream = SmcStream::seal([3u8; 16], 111, instrs, pool.clone(), redirs, funcs, None);
         let fake = SmcStream {
             key: stream.key,
             masked_salt: stream.masked_salt ^ 222 ^ stream.salt(), // corrupt salt
@@ -584,6 +671,9 @@ mod tests {
             pool: stream.pool.clone(),
             redirs: stream.redirs.clone(),
             funcs: stream.funcs.clone(),
+            cfi_table: stream.cfi_table.clone(),
+            cfi_fp: stream.cfi_fp,
+            cfi_in_block: stream.cfi_in_block,
         };
         // Garbage may not be valid UTF-8, so compare on the raw decrypted
         // bytes: a wrong salt must not reproduce the plaintext.
@@ -599,7 +689,7 @@ mod tests {
         // eval splicing path: unseal → (caller splices) → re-seal with the
         // same key+salt must decode identically afterwards.
         let (instrs, pool, redirs, funcs) = sample();
-        let stream = SmcStream::seal([13u8; 16], 55, instrs.clone(), pool, redirs, funcs);
+        let stream = SmcStream::seal([13u8; 16], 55, instrs.clone(), pool, redirs, funcs, None);
         let parts = stream.unseal().unwrap();
         assert_eq!(parts.salt, 55);
         let re = SmcStream::seal(
@@ -609,6 +699,7 @@ mod tests {
             parts.pool.clone(),
             parts.redirs,
             parts.funcs,
+            None,
         );
         let mut re = re;
         for (i, want) in instrs.iter().enumerate() {
@@ -630,8 +721,15 @@ mod tests {
         .enumerate()
         {
             let (instrs, pool, redirs, funcs) = sample();
-            let mut stream =
-                SmcStream::seal(*key, n as u32, instrs.clone(), pool.clone(), redirs, funcs);
+            let mut stream = SmcStream::seal(
+                *key,
+                n as u32,
+                instrs.clone(),
+                pool.clone(),
+                redirs,
+                funcs,
+                None,
+            );
             for (i, want) in instrs.iter().enumerate() {
                 assert_eq!(&stream.instr_at(i).unwrap(), want, "shape key {n}");
             }
@@ -642,9 +740,87 @@ mod tests {
     #[test]
     fn encrypted_bytes_differ_from_plaintext() {
         let (instrs, pool, redirs, funcs) = sample();
-        let stream = SmcStream::seal([9u8; 16], 3, instrs.clone(), pool, redirs, funcs);
+        let stream = SmcStream::seal([9u8; 16], 3, instrs.clone(), pool, redirs, funcs, None);
         for (i, r) in instrs.iter().enumerate() {
             assert_ne!(stream.instrs[i], r.to_bytes());
+        }
+    }
+
+    fn sample_big() -> (Vec<RawInstr>, Vec<String>, Vec<SmcRedir>, Vec<SmcFunc>) {
+        // 70 rows = 3 CFI blocks (32 + 32 + 6).
+        let instrs: Vec<RawInstr> = (0..70u32)
+            .map(|i| RawInstr {
+                op: if i % 5 == 0 { 0x01 } else { 0x02 },
+                operand: i.wrapping_mul(0x0101_0101),
+            })
+            .collect();
+        (instrs, vec!["a".into()], vec![], vec![])
+    }
+
+    #[test]
+    fn cfi_clean_stream_decodes_all_blocks() {
+        let (instrs, pool, redirs, funcs) = sample_big();
+        let mut stream = SmcStream::seal([7u8; 16], 5, instrs.clone(), pool, redirs, funcs, None);
+        for (i, want) in instrs.iter().enumerate() {
+            assert_eq!(&stream.instr_at(i).unwrap(), want, "row {i}");
+        }
+        assert_eq!(stream.cfi_table.len(), 3);
+    }
+
+    #[test]
+    fn cfi_build_table_accepted() {
+        // Some(table) path: the build-time table from the protect payload.
+        let (instrs, pool, redirs, funcs) = sample_big();
+        let table = cfi_table_of(&instrs);
+        let mut stream = SmcStream::seal(
+            [21u8; 16],
+            8,
+            instrs.clone(),
+            pool,
+            redirs,
+            funcs,
+            Some(table),
+        );
+        for (i, want) in instrs.iter().enumerate() {
+            assert_eq!(&stream.instr_at(i).unwrap(), want, "row {i}");
+        }
+    }
+
+    #[test]
+    fn cfi_detects_patched_row() {
+        let (instrs, pool, redirs, funcs) = sample_big();
+        let mut stream = SmcStream::seal([7u8; 16], 5, instrs.clone(), pool, redirs, funcs, None);
+        // Decode rows 0..40 so the block-1 fingerprint is mid-flight.
+        for i in 0..40 {
+            stream.instr_at(i).unwrap();
+        }
+        // Patch an encrypted row inside block 1 (rows 32..63).
+        stream.instrs[40][2] ^= 0xFF;
+        // Row 40 itself decodes differently (its own ciphertext changed)...
+        assert_ne!(stream.instr_at(40).unwrap(), instrs[40]);
+        // ...and the block-1 boundary check at row 63 must fail.
+        for i in 41..63 {
+            stream.instr_at(i);
+        }
+        assert!(
+            stream.instr_at(63).is_none(),
+            "CFI missed a patched row at block boundary"
+        );
+    }
+
+    #[test]
+    fn cfi_rewind_resets_block_fingerprint() {
+        // Backward jump replays rows through an already-partial block;
+        // without a fingerprint reset the recheck would fail on a clean
+        // stream.
+        let (instrs, pool, redirs, funcs) = sample_big();
+        let mut stream = SmcStream::seal([7u8; 16], 5, instrs.clone(), pool, redirs, funcs, None);
+        for i in 0..40 {
+            stream.instr_at(i).unwrap();
+        }
+        assert_eq!(&stream.instr_at(5).unwrap(), &instrs[5]);
+        for i in 6..70 {
+            assert_eq!(&stream.instr_at(i).unwrap(), &instrs[i], "row {i}");
         }
     }
 }

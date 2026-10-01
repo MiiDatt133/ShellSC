@@ -17,7 +17,20 @@
 //!    preserved, but the pool no longer holds the full literal in one
 //!    piece for a static string-dump to read.
 //!
-//! Both passes are seed-driven: two protected builds of the same script
+//! 3. **Conditional double negation** — `JmpIfFail T` becomes
+//!    `JmpIfOk SKIP; Jmp T; SKIP:` and vice versa: the branch condition is
+//!    inverted, the fall-through path hops over an inserted unconditional
+//!    jump. Status is never mutated, so `$?` at the target and fall-through
+//!    is byte-identical to the original. Exception: a `JmpIfFail` directly
+//!    after `ForBind` is left alone — its `for_exit_status.take()` side
+//!    effect (for-loop exit status restoration) has no equivalent here.
+//!
+//! 4. **Arithmetic neutral append** — before `ArithEvalStack`, insert
+//!    `PushConst("+0") ConcatN(2)` so the evaluated expression becomes
+//!    `expr+0`. `+` is the lowest-precedence operator in the VM's
+//!    ArithParser, so the appended term never changes the value.
+//!
+//! All passes are seed-driven: two protected builds of the same script
 //! get different cut points and decoy placements.
 
 use crate::{
@@ -30,6 +43,8 @@ use crate::{
 pub struct ObfuscateOptions {
     pub bogus_cf: bool,
     pub subst: bool,
+    pub condneg: bool,
+    pub arith_neutral: bool,
     pub seed: u32,
 }
 
@@ -61,6 +76,12 @@ pub fn obfuscate(bc: &mut Bytecode, opts: &ObfuscateOptions) {
     }
     if opts.bogus_cf {
         bogus_control_flow(bc, opts.seed);
+    }
+    if opts.condneg {
+        cond_double_neg(bc, opts.seed);
+    }
+    if opts.arith_neutral {
+        arith_neutral(bc, opts.seed);
     }
     if std::env::var_os("SHELLSC_OBF_DEBUG").is_some() {
         for (i, ins) in bc.instructions.iter().enumerate() {
@@ -218,6 +239,127 @@ fn bogus_control_flow(bc: &mut Bytecode, seed: u32) {
     bc.const_pool = pool;
 }
 
+// ── Pass 3: conditional double negation ──────────────────────────────────────
+
+fn cond_double_neg(bc: &mut Bytecode, seed: u32) {
+    let mut rng = Rng::new(seed ^ 0xC0FD_6E97);
+    let instrs = std::mem::take(&mut bc.instructions);
+    let pool: ConstPool = std::mem::take(&mut bc.const_pool);
+
+    // Pick conditionals to invert. A JmpIfFail directly after ForBind is
+    // the for-loop exit: its take() of for_exit_status restores the
+    // pre-exhaust $? at the loop exit, which the inverted form loses.
+    let mut chosen = vec![false; instrs.len()];
+    let mut any = false;
+    for (i, ins) in instrs.iter().enumerate() {
+        if !matches!(ins.op, Opcode::JmpIfFail | Opcode::JmpIfOk) {
+            continue;
+        }
+        if ins.op == Opcode::JmpIfFail && i > 0 && instrs[i - 1].op == Opcode::ForBind {
+            continue;
+        }
+        if rng.chance(4, 10) {
+            chosen[i] = true;
+            any = true;
+        }
+    }
+    if !any {
+        bc.instructions = instrs;
+        bc.const_pool = pool;
+        return;
+    }
+
+    // Inverted form (for `JmpIfCond T` with opposite condition `Opp`):
+    //   Opp SKIP     ; taken on the original fall-through path
+    //   Jmp T        ; taken on the original jump path
+    //   SKIP:        ; next original instruction
+    // Status is untouched, so $? at T and at SKIP equals the original.
+    // The inverted condition's operand is a new-space local label — it is
+    // filled in after the old-space remap (same retarget scheme as bcf).
+    let mut out: Vec<Instruction> = Vec::with_capacity(instrs.len() * 2);
+    let mut label_map = vec![0u32; instrs.len()];
+    let mut retargets: Vec<(usize, u32)> = Vec::new();
+
+    for (old_i, ins) in instrs.into_iter().enumerate() {
+        label_map[old_i] = out.len() as u32;
+        if !chosen[old_i] {
+            out.push(ins);
+            continue;
+        }
+        let target = ins.operand; // old index — remapped below via label_map
+        let inv_op = if ins.op == Opcode::JmpIfFail {
+            Opcode::JmpIfOk
+        } else {
+            Opcode::JmpIfFail
+        };
+        let cond_pos = out.len();
+        out.push(Instruction::new(inv_op, 0));
+        out.push(Instruction::new(Opcode::Jmp, target));
+        retargets.push((cond_pos, out.len() as u32));
+    }
+
+    for ins in out.iter_mut() {
+        if matches!(
+            ins.op,
+            Opcode::Jmp | Opcode::JmpIfFail | Opcode::JmpIfOk | Opcode::PipeSubshellBegin
+        ) {
+            ins.operand = label_map[ins.operand as usize];
+        }
+    }
+    for &(pos, skip) in &retargets {
+        out[pos].operand = skip;
+    }
+    for f in bc.funcs.iter_mut() {
+        f.entry_ip = label_map[f.entry_ip as usize];
+    }
+
+    bc.instructions = out;
+    bc.const_pool = pool;
+}
+
+// ── Pass 4: arithmetic neutral append ────────────────────────────────────────
+
+fn arith_neutral(bc: &mut Bytecode, seed: u32) {
+    let mut rng = Rng::new(seed ^ 0xA417_0000);
+    let instrs = std::mem::take(&mut bc.instructions);
+    let mut pool: ConstPool = std::mem::take(&mut bc.const_pool);
+
+    let mut label_map = vec![0u32; instrs.len()];
+    let mut out: Vec<Instruction> = Vec::with_capacity(instrs.len() + 8);
+    let mut plus0: Option<u32> = None;
+
+    for (old_i, ins) in instrs.into_iter().enumerate() {
+        label_map[old_i] = out.len() as u32;
+        if ins.op == Opcode::ArithEvalStack && rng.chance(5, 10) {
+            let p = *plus0.get_or_insert_with(|| pool.intern("+0"));
+            out.push(Instruction::new(Opcode::PushConst, p));
+            out.push(Instruction::new(Opcode::ConcatN, 2));
+            // Re-anchor the label past the insertion: a jump aimed at this
+            // ArithEvalStack arrives exactly as in the original stream
+            // (stack untouched), skipping the inserted "+0" pair.
+            label_map[old_i] = out.len() as u32;
+            out.push(ins);
+            continue;
+        }
+        out.push(ins);
+    }
+
+    for ins in out.iter_mut() {
+        if matches!(
+            ins.op,
+            Opcode::Jmp | Opcode::JmpIfFail | Opcode::JmpIfOk | Opcode::PipeSubshellBegin
+        ) {
+            ins.operand = label_map[ins.operand as usize];
+        }
+    }
+    for f in bc.funcs.iter_mut() {
+        f.entry_ip = label_map[f.entry_ip as usize];
+    }
+
+    bc.instructions = out;
+    bc.const_pool = pool;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -276,10 +418,16 @@ mod tests {
     }
 
     fn replay(bc: &Bytecode) -> Vec<String> {
+        replay_with(bc, false)
+    }
+
+    fn replay_with(bc: &Bytecode, failed: bool) -> Vec<String> {
         // Simulate the VM stack protocol for PushConst/ConcatN/Jmp and the
         // neutral RedirSave/RedirRestore decoy ops: walk until a non-handled
         // opcode; Jmp follows its operand. PipeSubshellBegin arms an
         // ip_fence — crossing it ends the walk, mirroring vm.rs run().
+        // `failed` is the static $? seen by conditional jumps (the harness
+        // does not model status changes mid-walk).
         let mut stack: Vec<String> = vec![];
         let mut ip = 0usize;
         let mut steps = 0;
@@ -304,6 +452,28 @@ mod tests {
                     ip += 1;
                 }
                 Opcode::Jmp => ip = ins.operand as usize,
+                Opcode::JmpIfFail => {
+                    if failed {
+                        ip = ins.operand as usize;
+                    } else {
+                        ip += 1;
+                    }
+                }
+                Opcode::JmpIfOk => {
+                    if !failed {
+                        ip = ins.operand as usize;
+                    } else {
+                        ip += 1;
+                    }
+                }
+                Opcode::ArithEvalStack => {
+                    // ArithParser value semantics: evaluating "expr+0"
+                    // yields the same i64 as "expr" (mirror in harness).
+                    let e = stack.pop().unwrap();
+                    stack.push(e.strip_suffix("+0").map(str::to_string).unwrap_or(e));
+                    ip += 1;
+                }
+                Opcode::ForBind => ip += 1,
                 Opcode::RedirSave | Opcode::RedirRestore => ip += 1,
                 Opcode::PipeSubshellBegin => {
                     fence = Some(ins.operand as usize);
@@ -324,6 +494,8 @@ mod tests {
             &ObfuscateOptions {
                 bogus_cf: false,
                 subst: true,
+                condneg: false,
+                arith_neutral: false,
                 seed: 7,
             },
         );
@@ -343,6 +515,8 @@ mod tests {
                 &ObfuscateOptions {
                     bogus_cf: false,
                     subst: true,
+                    condneg: false,
+                    arith_neutral: false,
                     seed,
                 },
             );
@@ -363,6 +537,8 @@ mod tests {
                 &ObfuscateOptions {
                     bogus_cf: true,
                     subst: false,
+                    condneg: false,
+                    arith_neutral: false,
                     seed,
                 },
             );
@@ -379,6 +555,8 @@ mod tests {
             &ObfuscateOptions {
                 bogus_cf: true,
                 subst: false,
+                condneg: false,
+                arith_neutral: false,
                 seed: 3,
             },
         );
@@ -413,6 +591,8 @@ mod tests {
                 &ObfuscateOptions {
                     bogus_cf: true,
                     subst: false,
+                    condneg: false,
+                    arith_neutral: false,
                     seed,
                 },
             );
@@ -429,6 +609,8 @@ mod tests {
                 &ObfuscateOptions {
                     bogus_cf: true,
                     subst: false,
+                    condneg: false,
+                    arith_neutral: false,
                     seed,
                 },
             );
@@ -440,5 +622,194 @@ mod tests {
         let b = build(2);
         let c = build(3);
         assert!(a != b || a != c || b != c, "layouts identical across seeds");
+    }
+
+    // ── condneg ──────────────────────────────────────────────────────────────
+
+    fn sample_cond(op: Opcode) -> Bytecode {
+        // 0: head; 1: op -> 4; 2: fall; 3: Jmp 5; 4: taken; 5: Exit
+        let mut bc = Bytecode::default();
+        bc.const_pool.strings.push("head".to_string());
+        bc.const_pool.strings.push("fall".to_string());
+        bc.const_pool.strings.push("taken".to_string());
+        bc.instructions.push(Instruction::new(Opcode::PushConst, 0));
+        bc.instructions.push(Instruction::new(op, 4));
+        bc.instructions.push(Instruction::new(Opcode::PushConst, 1));
+        bc.instructions.push(Instruction::new(Opcode::Jmp, 5));
+        bc.instructions.push(Instruction::new(Opcode::PushConst, 2));
+        bc.instructions.push(Instruction::no_operand(Opcode::Exit));
+        bc
+    }
+
+    #[test]
+    fn condneg_preserves_replay_semantics() {
+        for op in [Opcode::JmpIfFail, Opcode::JmpIfOk] {
+            let orig = sample_cond(op.clone());
+            for failed in [false, true] {
+                let want = replay_with(&orig, failed);
+                for seed in [0u32, 1, 7, 42, 0xFFFF_FFFF] {
+                    let mut bc = sample_cond(op.clone());
+                    obfuscate(
+                        &mut bc,
+                        &ObfuscateOptions {
+                            bogus_cf: false,
+                            subst: false,
+                            condneg: true,
+                            arith_neutral: false,
+                            seed,
+                        },
+                    );
+                    assert_eq!(
+                        replay_with(&bc, failed),
+                        want,
+                        "op {op:?} failed={failed} seed {seed}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn condneg_targets_in_range() {
+        for op in [Opcode::JmpIfFail, Opcode::JmpIfOk] {
+            let mut bc = sample_cond(op);
+            obfuscate(
+                &mut bc,
+                &ObfuscateOptions {
+                    bogus_cf: false,
+                    subst: false,
+                    condneg: true,
+                    arith_neutral: false,
+                    seed: 3,
+                },
+            );
+            let len = bc.instructions.len() as u32;
+            for ins in &bc.instructions {
+                if matches!(ins.op, Opcode::Jmp | Opcode::JmpIfFail | Opcode::JmpIfOk) {
+                    assert!(ins.operand < len, "target {} out of range", ins.operand);
+                }
+            }
+            assert!(bc.instructions.iter().any(|i| i.op == Opcode::Exit));
+        }
+    }
+
+    #[test]
+    fn condneg_varies_layout_across_seeds() {
+        let orig_len = sample_cond(Opcode::JmpIfFail).instructions.len();
+        let grew = (0u32..16).any(|seed| {
+            let mut bc = sample_cond(Opcode::JmpIfFail);
+            obfuscate(
+                &mut bc,
+                &ObfuscateOptions {
+                    bogus_cf: false,
+                    subst: false,
+                    condneg: true,
+                    arith_neutral: false,
+                    seed,
+                },
+            );
+            bc.instructions.len() == orig_len + 1 // 1 cond replaced by 2
+        });
+        assert!(grew, "condneg never fired across 16 seeds");
+    }
+
+    #[test]
+    fn condneg_skips_forbind_loop_exit() {
+        // ForBind immediately followed by JmpIfFail is the for-loop exit —
+        // its for_exit_status.take() side effect must survive, so the
+        // transform must leave that jump alone.
+        let mut bc = Bytecode::default();
+        bc.const_pool.strings.push("i".to_string());
+        bc.const_pool.strings.push("body".to_string());
+        bc.instructions.push(Instruction::new(Opcode::ForBind, 0)); // 0
+        bc.instructions.push(Instruction::new(Opcode::JmpIfFail, 4)); // 1: loop exit
+        bc.instructions.push(Instruction::new(Opcode::PushConst, 1)); // 2
+        bc.instructions.push(Instruction::new(Opcode::Jmp, 1)); // 3: back edge
+        bc.instructions.push(Instruction::no_operand(Opcode::Exit)); // 4
+        let orig_len = bc.instructions.len();
+
+        for seed in 0u32..16 {
+            let mut bc = bc.clone();
+            obfuscate(
+                &mut bc,
+                &ObfuscateOptions {
+                    bogus_cf: false,
+                    subst: false,
+                    condneg: true,
+                    arith_neutral: false,
+                    seed,
+                },
+            );
+            assert_eq!(bc.instructions.len(), orig_len, "seed {seed}");
+            assert_eq!(bc.instructions[1].op, Opcode::JmpIfFail, "seed {seed}");
+        }
+    }
+
+    // ── arith_neutral ────────────────────────────────────────────────────────
+
+    fn sample_arith() -> Bytecode {
+        let mut bc = Bytecode::default();
+        bc.const_pool.strings.push("7".to_string());
+        bc.instructions.push(Instruction::new(Opcode::PushConst, 0));
+        bc.instructions
+            .push(Instruction::new(Opcode::ArithEvalStack, 0));
+        bc.instructions.push(Instruction::no_operand(Opcode::Exit));
+        bc
+    }
+
+    #[test]
+    fn arith_neutral_preserves_result() {
+        let want = replay(&sample_arith());
+        assert_eq!(want, vec!["7"], "arith baseline wrong");
+
+        let mut grew = false;
+        for seed in 0u32..16 {
+            let mut bc = sample_arith();
+            obfuscate(
+                &mut bc,
+                &ObfuscateOptions {
+                    bogus_cf: false,
+                    subst: false,
+                    condneg: false,
+                    arith_neutral: true,
+                    seed,
+                },
+            );
+            if bc.instructions.len() > 3 {
+                grew = true;
+            }
+            assert_eq!(replay(&bc), want, "seed {seed} changed arith result");
+        }
+        assert!(grew, "arith_neutral never fired across test seeds");
+    }
+
+    #[test]
+    fn arith_neutral_appends_zero_expr() {
+        // Find a seed where the pass fires and check the stack shape:
+        // expr pushed, "+0" pushed, ConcatN joins to "7+0".
+        for seed in 0u32..32 {
+            let mut bc = sample_arith();
+            obfuscate(
+                &mut bc,
+                &ObfuscateOptions {
+                    bogus_cf: false,
+                    subst: false,
+                    condneg: false,
+                    arith_neutral: true,
+                    seed,
+                },
+            );
+            if bc.instructions.len() > 3 {
+                let has_plus0 = bc.const_pool.strings.iter().any(|s| s == "+0");
+                assert!(has_plus0, "seed {seed}: +0 missing from pool");
+                assert_eq!(
+                    bc.instructions[0].op,
+                    Opcode::PushConst,
+                    "seed {seed}: insert must precede ArithEvalStack"
+                );
+                return;
+            }
+        }
+        panic!("arith_neutral never fired across 32 seeds");
     }
 }

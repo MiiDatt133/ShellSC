@@ -74,6 +74,10 @@ fn run() -> Result<()> {
                 0
             };
 
+            // CFI block table extracted alongside the bytecode; handed to
+            // enable_smc so runtime decoding verifies every 32 rows.
+            let mut cfi_table: Option<Vec<u32>> = None;
+
             let mut bc_bytes: Vec<u8> = if is_protected {
                 eprintln!("Protected by ShellSC");
                 let header = shell_pack::ProtectHeader::from_bytes(payload)
@@ -91,9 +95,10 @@ fn run() -> Result<()> {
                     selfdebug_check()?;
                 }
                 anti_dump_harden(&bytes);
-                let bc = shell_pack::open(payload, text_crc)
+                let (bc, cfi) = shell_pack::open(payload, text_crc)
                     .map_err(|e| anyhow::anyhow!("unsealing bytecode: {}", e))?
                     .context("protected payload too short")?;
+                cfi_table = cfi;
                 header_opt = Some(header);
                 bc
             } else {
@@ -122,7 +127,7 @@ fn run() -> Result<()> {
                         *b = b.wrapping_add(h.crc32 as u8).rotate_left(2)
                             ^ (seeds.cff_seed as u8).wrapping_mul(31 ^ i as u8);
                     }
-                    vm.enable_smc(k);
+                    vm.enable_smc(k, cfi_table);
                     k.iter_mut().for_each(|b| *b = 0);
                 }
             }

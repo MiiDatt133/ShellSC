@@ -214,7 +214,7 @@ impl Vm {
     /// Enable self-modifying bytecode: seal the whole program into an
     /// encrypted stream and blank the plaintext copies. From here on the
     /// dispatch loop decrypts one instruction at a time via `smc_instr()`.
-    pub fn enable_smc(&mut self, key: [u8; 16]) {
+    pub fn enable_smc(&mut self, key: [u8; 16], cfi: Option<Vec<u32>>) {
         use crate::smc::{RawInstr, SmcFunc, SmcRedir, SmcStream, SmcTarget};
         let instrs: Vec<RawInstr> = std::mem::take(&mut self.bc.instructions)
             .into_iter()
@@ -246,7 +246,7 @@ impl Vm {
             .collect();
 
         let salt = crate::entropy::runtime_salt();
-        self.smc = Some(SmcStream::seal(key, salt, instrs, pool, redirs, funcs));
+        self.smc = Some(SmcStream::seal(key, salt, instrs, pool, redirs, funcs, cfi));
     }
 
     /// Current instruction count, from whichever store is live.
@@ -505,6 +505,9 @@ impl Vm {
                 cur.const_pool.strings.clone(),
                 redirs,
                 funcs,
+                // Spliced program: derive a fresh CFI table from the rows
+                // being sealed (the build-time table no longer covers them).
+                None,
             ));
         } else {
             self.bc = cur;

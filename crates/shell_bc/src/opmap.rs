@@ -13,6 +13,11 @@ use crate::bytecode::Bytecode;
 
 use crate::opcode::Opcode;
 
+/// Rows per CFI block — shared by the build-time checksum table
+/// (`shell_pack::protect`) and the runtime verifier (`shell_vm::smc`).
+/// Both sides MUST agree here or every protected build fails closed.
+pub const CFI_BLOCK: usize = 32;
+
 /// Byte offset of each instruction's opcode byte within the stream.
 pub fn instruction_offsets(data: &[u8]) -> Result<Vec<usize>, ShellError> {
     let mut r = Reader::new(data);

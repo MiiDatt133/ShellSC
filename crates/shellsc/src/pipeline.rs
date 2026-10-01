@@ -46,6 +46,8 @@ pub fn full_pipeline(
             &ObfuscateOptions {
                 bogus_cf: pass != "sub",
                 subst: pass != "bcf",
+                condneg: pass == "",
+                arith_neutral: pass == "",
                 seed: obf_seed,
             },
         );
