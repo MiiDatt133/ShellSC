@@ -87,6 +87,7 @@ fn run() -> Result<()> {
                 // the checks before hardening, harden before decryption.
                 if header.flags & shell_pack::protect::FLAG_ANTIDEBUG != 0 {
                     antidebug_check()?;
+                    timing_anomaly_check()?;
                 }
                 if header.flags & shell_pack::protect::FLAG_ANTIHOOK != 0 {
                     antihook_check()?;
@@ -107,7 +108,9 @@ fn run() -> Result<()> {
 
             let bc = Bytecode::from_bytes(&bc_bytes)
                 .map_err(|e| anyhow::anyhow!("deserializing bytecode: {}", e))?;
-            bc_bytes.iter_mut().for_each(|b| *b ^= 0xFF);
+            // Scrub the plaintext bytecode buffer — an attacker dumping
+            // heap pages must not find the open stream intact.
+            bc_bytes.fill(0);
             drop(bc_bytes);
 
             let mut vm = Vm::new(bc);
@@ -163,6 +166,38 @@ fn antidebug_check() -> Result<()> {
         }
     }
     bail!("TracerPid not found in /proc/self/status")
+}
+
+fn monotonic_ns() -> u64 {
+    unsafe {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        if libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) != 0 {
+            return 0;
+        }
+        (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
+    }
+}
+
+/// Busy-loop timing gate: single-stepping, instruction-counting, or heavy
+/// LD_DEBUG-style instrumentation inflates the loop below by orders of
+/// magnitude. Native release speed finishes in single-digit milliseconds;
+/// the threshold leaves a wide margin for thermal throttling while still
+/// catching debugger-driven execution.
+fn timing_anomaly_check() -> Result<()> {
+    let start = monotonic_ns();
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    for i in 0..2_000_000u64 {
+        x = x.wrapping_mul(i | 1) ^ x.rotate_left(17);
+    }
+    std::hint::black_box(x);
+    let elapsed = monotonic_ns().saturating_sub(start);
+    if elapsed > 500_000_000 {
+        bail!("timing check failed ({elapsed} ns) — traced or emulated");
+    }
+    Ok(())
 }
 
 /// Refuse to run with library hooks in play. Three signals:

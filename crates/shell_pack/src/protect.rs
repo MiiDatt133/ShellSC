@@ -24,7 +24,11 @@ pub const PROTECT_MAGIC: &[u8; 12] = b"SHELLSC_PROT";
 /// KDF over (text_crc, salt, flags) — a single offline derivation costs
 /// milliseconds and brute-forcing a patched .text CRC becomes infeasible.
 /// Also stops the v5 opaque_param key-byte leak (params are random now).
-pub const PROTECT_VERSION: u8 = 6;
+/// v7: per-build operand polymorphism — every instruction's 4-byte
+/// operand is XOR-masked with a keystream derived from the KDF's
+/// operand seed and the instruction's stream offset, so no two builds
+/// share operand bytes even for identical scripts.
+pub const PROTECT_VERSION: u8 = 7;
 
 /// magic 12 + version 1 + flags 1 + cff_seed 2 + key 16 + crc32 4 +
 /// orig_len 4 + opmap_seed 4 + opaque_param1 4 + opaque_param2 4 = 52 bytes.
@@ -82,7 +86,7 @@ impl ProtectHeader {
         if &bytes[0..12] != PROTECT_MAGIC {
             return Err(ShellError::IoError("bad protect magic".into()));
         }
-        // v4/v5 payloads stay readable; seal() only produces the current version.
+        // v4–v6 payloads stay readable; seal() only produces the current version.
         if bytes[12] > PROTECT_VERSION || bytes[12] < 4 {
             return Err(ShellError::IoError(format!(
                 "unsupported protect version {}",
@@ -338,12 +342,13 @@ fn mask_opmap_seed(seed: u32, text_hash: u32) -> u32 {
 /// into a minutes-long offline break — becomes multi-century work.
 pub const KDF_ROUNDS: u32 = 1 << 20;
 
-/// Expand (text_crc, salt, flags) into 24 bytes:
+/// Expand (text_crc, salt, flags) into 32 bytes:
 /// `[0..16]` crypto key, `[16..18]` cff_seed, `[18..22]` opmap_seed,
-/// `[22..24]` pad. The header stores only the random salt; nothing about
-/// the key exists in the file without also knowing the stub's .text CRC —
-/// and even then the attacker pays KDF_ROUNDS per guess.
-pub fn kdf_expand(text_crc: u32, salt: &[u8; 16], flags: u8) -> [u8; 24] {
+/// `[22..26]` operand seed (v7 polymorphism), rest reserved. The header
+/// stores only the random salt; nothing about the key exists in the file
+/// without also knowing the stub's .text CRC — and even then the attacker
+/// pays KDF_ROUNDS per guess.
+pub fn kdf_expand(text_crc: u32, salt: &[u8; 16], flags: u8) -> [u8; 32] {
     use shell_bc::pool_seal::{mix64, PHI_PUBLIC};
     let s0 = u64::from_le_bytes(salt[0..8].try_into().unwrap());
     let s1 = u64::from_le_bytes(salt[8..16].try_into().unwrap());
@@ -358,11 +363,13 @@ pub fn kdf_expand(text_crc: u32, salt: &[u8; 16], flags: u8) -> [u8; 24] {
     let o1 = mix64(state ^ b);
     let o2 = mix64(state.wrapping_add(c) ^ 0x1234_5678_9ABC_DEF0);
     let o3 = mix64(b ^ c.wrapping_add(o1));
-    let mut out = [0u8; 24];
+    let o4 = mix64(o1 ^ o3.wrapping_add(0x55AA_3CC3_1EE7_D00D));
+    let mut out = [0u8; 32];
     out[0..8].copy_from_slice(&o1.to_le_bytes());
     out[8..16].copy_from_slice(&o2.to_le_bytes());
     out[16..18].copy_from_slice(&(o3 as u16).to_le_bytes());
     out[18..22].copy_from_slice(&((o3 >> 16) as u32).to_le_bytes());
+    out[22..26].copy_from_slice(&((o4 as u32) ^ (o3 as u32)).to_le_bytes());
     out
 }
 
@@ -371,6 +378,31 @@ fn kdf_key(text_crc: u32, salt: &[u8; 16], flags: u8) -> [u8; 16] {
     let mut key = [0u8; 16];
     key.copy_from_slice(&mat[0..16]);
     key
+}
+
+// ── v7 operand polymorphism ─────────────────────────────────────────────────
+
+/// 4-byte keystream for the operand at stream offset `off`. Encoding and
+/// decoding are the same XOR; the seed comes from the KDF so two builds
+/// of the same script never share operand ciphertext.
+fn operand_keystream(seed: u32, off: u32) -> [u8; 4] {
+    use shell_bc::pool_seal::mix64;
+    let v = mix64(u64::from(seed) ^ (u64::from(off).wrapping_mul(0x9E37_79B9_7F4A_7C15)));
+    (v as u32).to_le_bytes()
+}
+
+/// XOR-mask every instruction's operand in place. `decode` == `apply`
+/// (symmetric XOR); version gating decides which side of the pipeline
+/// calls it.
+pub fn apply_operand_map(bc_bytes: &mut [u8], seed: u32) -> Result<(), ShellError> {
+    let offsets = shell_bc::opmap::instruction_offsets(bc_bytes)?;
+    for off in offsets {
+        let ks = operand_keystream(seed, off as u32);
+        for j in 0..4 {
+            bc_bytes[off + 1 + j] ^= ks[j];
+        }
+    }
+    Ok(())
 }
 
 /// Compute the CRC32 of the ELF stub's executable code (.text section).
@@ -428,6 +460,7 @@ pub fn seal(bc_bytes: &[u8], opts: ProtectOptions, text_hash: u32) -> Result<Vec
     let mut key = [0u8; 16];
     key.copy_from_slice(&mat[0..16]);
     let kdf_opmap_seed = u32::from_le_bytes(mat[18..22].try_into().unwrap());
+    let kdf_operand_seed = u32::from_le_bytes(mat[22..26].try_into().unwrap());
 
     let mut body = bc_bytes.to_vec();
 
@@ -451,6 +484,12 @@ pub fn seal(bc_bytes: &[u8], opts: ProtectOptions, text_hash: u32) -> Result<Vec
         let perm = opcode_permutation(kdf_opmap_seed);
         apply_opmap(&mut body, &perm)?;
     }
+
+    // v7 operand polymorphism: mask every operand with a per-build
+    // keystream so even unshuffled streams differ byte-for-byte across
+    // builds. Applied unconditionally — open() decodes for every v7
+    // payload regardless of the encrypt flag.
+    apply_operand_map(&mut body, kdf_operand_seed)?;
 
     // CFI table sits AHEAD of the shuffled stream (never inside the
     // instruction region the opmap walk sees) and is encrypted together
@@ -503,14 +542,17 @@ pub fn seal(bc_bytes: &[u8], opts: ProtectOptions, text_hash: u32) -> Result<Vec
 pub struct DerivedSeeds {
     pub cff_seed: u16,
     pub opmap_seed: u32,
+    /// v7 operand polymorphism seed (0 for older versions).
+    pub operand_seed: u32,
 }
 
 pub fn derive_seeds(header: &ProtectHeader, version: u8, text_hash: u32) -> DerivedSeeds {
-    if version >= PROTECT_VERSION {
+    if version >= 6 {
         let mat = kdf_expand(text_hash, &header.key, header.flags);
         return DerivedSeeds {
             cff_seed: u16::from_le_bytes(mat[16..18].try_into().unwrap()),
             opmap_seed: u32::from_le_bytes(mat[18..22].try_into().unwrap()),
+            operand_seed: u32::from_le_bytes(mat[22..26].try_into().unwrap()),
         };
     }
     DerivedSeeds {
@@ -524,6 +566,7 @@ pub fn derive_seeds(header: &ProtectHeader, version: u8, text_hash: u32) -> Deri
         } else {
             header.opmap_seed
         },
+        operand_seed: 0,
     }
 }
 
@@ -586,8 +629,17 @@ pub fn open(
     let seeds = derive_seeds(&header, version, text_hash);
 
     if header.flags & FLAG_OPMAP != 0 && seeds.opmap_seed != 0 {
-        let inv = opcode_inverse(seeds.opmap_seed, version < PROTECT_VERSION);
+        // Pre-v5 payloads were sealed with the host-word-size shuffle.
+        let inv = opcode_inverse(seeds.opmap_seed, version < 5);
         revert_opmap(&mut body, &inv).map_err(|_| {
+            ShellError::IoError("binary tampered: refuse to run modified executable".into())
+        })?;
+    }
+
+    // v7 operand polymorphism: undo the per-build operand mask before the
+    // CRC check (the checksum covers the plain stream).
+    if version >= 7 {
+        apply_operand_map(&mut body, seeds.operand_seed).map_err(|_| {
             ShellError::IoError("binary tampered: refuse to run modified executable".into())
         })?;
     }
@@ -1005,5 +1057,32 @@ mod tests {
             err.contains("tampered") || err.contains("mismatch"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn operand_map_symmetric_and_seed_dependent() {
+        let bc_bytes = sample_shbc();
+        let mut a = bc_bytes.clone();
+        let mut b = bc_bytes.clone();
+        apply_operand_map(&mut a, 1).unwrap();
+        apply_operand_map(&mut b, 2).unwrap();
+        assert_ne!(a, b, "operand mask must depend on the seed");
+        // Symmetric: applying twice restores.
+        apply_operand_map(&mut a, 1).unwrap();
+        assert_eq!(a, bc_bytes);
+    }
+
+    #[test]
+    fn v7_two_builds_differ_in_operands() {
+        // Same script, two seals: per-build polymorphism — every seal gets
+        // a fresh KDF salt, hence a fresh operand keystream.
+        let bc_bytes = sample_shbc();
+        let s1 = seal(&bc_bytes, ProtectOptions::all(), 0).unwrap();
+        let s2 = seal(&bc_bytes, ProtectOptions::all(), 0).unwrap();
+        assert_ne!(s1, s2);
+        let (o1, _) = open(&s1, 0).unwrap().unwrap();
+        let (o2, _) = open(&s2, 0).unwrap().unwrap();
+        assert_opens_equivalent(&bc_bytes, &o1);
+        assert_opens_equivalent(&bc_bytes, &o2);
     }
 }
