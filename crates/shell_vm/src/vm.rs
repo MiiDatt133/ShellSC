@@ -137,6 +137,12 @@ pub struct Vm {
     /// plaintext `bc` fields are emptied and every access decrypts through
     /// here instead — the program never exists whole in memory.
     smc: Option<crate::smc::SmcStream>,
+    /// Periodic native integrity callback (protect builds only): nonzero
+    /// return aborts the run. Set via `set_guard`.
+    guard_fn: Option<extern "C" fn() -> i32>,
+    /// Dispatch iterations between guard checks, as a power-of-two mask.
+    guard_mask: u64,
+    guard_ctr: u64,
 }
 
 impl Vm {
@@ -187,6 +193,9 @@ impl Vm {
             opaque_p2: 0,
             poly_variant: 0,
             smc: None,
+            guard_fn: None,
+            guard_mask: (1 << 18) - 1,
+            guard_ctr: 0,
         }
     }
 
@@ -262,6 +271,15 @@ impl Vm {
 
         let salt = crate::entropy::runtime_salt();
         self.smc = Some(SmcStream::seal(key, salt, instrs, pool, redirs, funcs, cfi));
+    }
+
+    /// Install a periodic integrity callback invoked every `interval`
+    /// dispatch iterations (rounded up to a power of two). Protect stubs
+    /// use this for live .text CRC + tracer re-checks; plain builds leave
+    /// it unset and pay one branch per instruction.
+    pub fn set_guard(&mut self, f: extern "C" fn() -> i32, interval: u64) {
+        self.guard_fn = Some(f);
+        self.guard_mask = interval.max(1).next_power_of_two().saturating_sub(1);
     }
 
     /// Current instruction count, from whichever store is live.
@@ -630,6 +648,18 @@ impl Vm {
                 }
             }
             self.check_signals();
+            if self.guard_fn.is_some() {
+                self.guard_ctr = self.guard_ctr.wrapping_add(1);
+                if self.guard_ctr & self.guard_mask == 0 {
+                    if let Some(f) = self.guard_fn {
+                        if f() != 0 {
+                            return Err(ShellError::BytecodeError(
+                                "memory integrity check failed".into(),
+                            ));
+                        }
+                    }
+                }
+            }
             let instr = match &self.smc {
                 Some(_) => match self.smc_instr(self.ip) {
                     Some(i) => i,
@@ -4052,4 +4082,57 @@ fn trim_suffix_longest(s: &str, pattern: &str) -> String {
         }
     }
     s.to_string()
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    use shell_bc::bytecode::Instruction;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn counting_guard() -> i32 {
+        CALLS.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+
+    extern "C" fn failing_guard() -> i32 {
+        1
+    }
+
+    fn two_instr_vm() -> Vm {
+        let mut bc = Bytecode::new();
+        bc.instructions = vec![
+            Instruction::new(Opcode::PushArgs, 0),
+            Instruction::new(Opcode::Exit, 0),
+        ];
+        Vm::new(bc)
+    }
+
+    #[test]
+    fn guard_fires_each_dispatch_interval() {
+        CALLS.store(0, Ordering::SeqCst);
+        let mut vm = two_instr_vm();
+        // interval 1 → every dispatch iteration.
+        vm.set_guard(counting_guard, 1);
+        let st = vm.run().unwrap();
+        assert!(st.code() == 0);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2, "one check per instruction");
+    }
+
+    #[test]
+    fn guard_failure_aborts_run() {
+        let mut vm = two_instr_vm();
+        vm.set_guard(failing_guard, 1);
+        let err = vm.run().unwrap_err();
+        assert!(err.to_string().contains("integrity"), "{err}");
+    }
+
+    #[test]
+    fn no_guard_runs_normally() {
+        let mut vm = two_instr_vm();
+        let st = vm.run().unwrap();
+        assert!(st.code() == 0);
+    }
 }

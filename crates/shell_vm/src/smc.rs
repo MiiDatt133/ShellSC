@@ -11,12 +11,13 @@
 //!    decrypted instruction `i-1` first: no parallel/sliced decryption, an
 //!    unpacker must replay the chain from index 0 exactly.
 //!
-//! 2. **Runtime salt for pool data** — const-pool strings, heredoc bodies
-//!    and function names are additionally masked with a per-process salt
-//!    generated from real entropy at VM startup. The salt never exists in
-//!    the `.sc` file, so a static tool decrypting the file yields garbage
-//!    for every string even with the correct key; only a live process that
-//!    ran `enable_smc` can read them.
+//! 2. **Runtime salt** — the instruction chain init and all pool data
+//!    (const-pool strings, heredoc bodies, function names) fold in a
+//!    per-process salt generated from real entropy at VM startup. The
+//!    salt never exists in the `.sc` file, so every run's ciphertext
+//!    differs (VMProtect-style mutation) and a static tool decrypting
+//!    the file yields garbage even with the correct key; only a live
+//!    process that ran `enable_smc` can read them.
 //!
 //! 3. **Polymorphic mixer shapes** — the keystream mixing function itself
 //!    is selected per build from 4 distinct algorithm shapes, keyed off
@@ -122,13 +123,15 @@ fn chain_keystream(shape: u8, state: u32, pos: usize) -> [u8; 5] {
     ks
 }
 
-/// Initial chain state, derived from the key alone.
-fn chain_init(key: [u8; 16]) -> u32 {
+/// Initial chain state: key material mixed with the runtime salt so the
+/// whole instruction stream (not just pool data) is per-run mutated.
+fn chain_init(key: [u8; 16], salt: u32) -> u32 {
     let k0 = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
     let k1 = u32::from_le_bytes([key[4], key[5], key[6], key[7]]);
     k0.rotate_left(13)
         ^ k1.wrapping_mul(0x9E37_79B9)
         ^ u32::from_le_bytes([key[8], key[9], key[10], key[11]])
+        ^ salt.rotate_left(11).wrapping_mul(0x85EB_CA6B)
 }
 
 /// Keystream for pool/redir/func data. Chained over the *index* so pool
@@ -136,7 +139,7 @@ fn chain_init(key: [u8; 16]) -> u32 {
 /// in — without the salt this keystream is wrong by construction.
 fn data_keystream(key: [u8; 16], salt: u32, idx: usize) -> [u8; 5] {
     let shape = shape_of(key);
-    let mut state = chain_init(key) ^ salt.rotate_left(17);
+    let mut state = chain_init(key, salt);
     for _ in 0..=idx {
         state = mix_step(shape, state, state >> 3);
     }
@@ -265,7 +268,7 @@ impl SmcStream {
         let shape = shape_of(key);
         // Seal the instruction chain sequentially: state after each row
         // is fed by that row's plaintext.
-        let mut state = chain_init(key);
+        let mut state = chain_init(key, salt);
         let enc_instrs = instrs
             .iter()
             .enumerate()
@@ -315,7 +318,7 @@ impl SmcStream {
                 f
             })
             .collect();
-        let chain = chain_init(key);
+        let chain = chain_init(key, salt);
         let k0 = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
         let k1 = u32::from_le_bytes([key[8], key[9], key[10], key[11]]);
         let mask = k0.wrapping_mul(0x9E37_79B9) ^ k1.rotate_left(17) ^ 0xA5A5_A5A5;
@@ -338,7 +341,7 @@ impl SmcStream {
     /// Reset the decode chain to the start (state = pre-instruction-0).
     /// Decoding always replays from here; the chain only moves forward.
     pub fn rewind(&mut self) {
-        self.chain = chain_init(self.key);
+        self.chain = chain_init(self.key, self.salt());
         self.chain_pos = 0;
         self.cfi_fp = 0xFFFF_FFFF;
         self.cfi_in_block = 0;
@@ -486,7 +489,7 @@ impl SmcStream {
     /// the same salt used at seal time; replays the chain sequentially.
     pub fn unseal(&self) -> Result<UnsealedParts, shell_ast::ShellError> {
         let shape = shape_of(self.key);
-        let mut state = chain_init(self.key);
+        let mut state = chain_init(self.key, self.salt());
         let instrs: Vec<RawInstr> = self
             .instrs
             .iter()
@@ -635,6 +638,29 @@ mod tests {
         let stream = SmcStream::seal([7u8; 16], 0, instrs, pool, redirs, funcs, None);
         // Identical instructions at positions 0 and 2 must not encrypt alike.
         assert_ne!(stream.instrs[0], stream.instrs[2]);
+    }
+
+    #[test]
+    fn instr_ciphertext_varies_with_salt() {
+        // Per-run mutation: same key + same plaintext, two runtime salts
+        // → different instruction ciphertext, both decode correctly.
+        let (instrs, pool, redirs, funcs) = sample();
+        let a = SmcStream::seal(
+            [7u8; 16],
+            1,
+            instrs.clone(),
+            pool.clone(),
+            redirs.clone(),
+            funcs.clone(),
+            None,
+        );
+        let mut b = SmcStream::seal([7u8; 16], 2, instrs.clone(), pool, redirs, funcs, None);
+        assert_ne!(a.instrs[0], b.instrs[0], "salt must mutate instr bytes");
+        let mut a = a;
+        for (i, want) in instrs.iter().enumerate() {
+            assert_eq!(&a.instr_at(i).unwrap(), want);
+            assert_eq!(&b.instr_at(i).unwrap(), want);
+        }
     }
 
     #[test]

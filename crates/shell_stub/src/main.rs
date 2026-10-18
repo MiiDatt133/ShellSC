@@ -2,7 +2,7 @@ mod raw;
 
 use std::{
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
 };
 
 use anyhow::{bail, Context, Result};
@@ -11,6 +11,14 @@ use shell_bc::Bytecode;
 use shell_vm::{set_sigint, set_sigterm, Vm};
 
 static SIGNALS_REGISTERED: AtomicBool = AtomicBool::new(false);
+// Mapped .text range + baseline CRC for the periodic integrity guard.
+static TEXT_PTR: AtomicUsize = AtomicUsize::new(0);
+static TEXT_LEN: AtomicUsize = AtomicUsize::new(0);
+static TEXT_CRC: AtomicUsize = AtomicUsize::new(0);
+static TEXT_FILE_OFF: AtomicUsize = AtomicUsize::new(0);
+// Self-debug child pid: the guard must not treat our own tracer as an
+// external debugger.
+static SELFDEBUG_CHILD: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn sigint_handler(_: libc::c_int) {
     set_sigint();
@@ -64,6 +72,16 @@ fn run() -> Result<()> {
 
             let mut header_opt: Option<shell_pack::ProtectHeader> = None;
             let is_protected = shell_pack::is_protected(payload);
+
+            // Remember .text file location for the runtime integrity guard
+            // (mapped address resolved later, after hardening).
+            for sh2 in &elf.section_headers {
+                if elf.shdr_strtab.get_at(sh2.sh_name) == Some(".text") {
+                    TEXT_FILE_OFF.store(sh2.sh_offset as usize, Ordering::Relaxed);
+                    TEXT_LEN.store(sh2.sh_size as usize, Ordering::Relaxed);
+                    break;
+                }
+            }
 
             // Derive the key from clean ELF bytes BEFORE anti-dump hardening
             // zeroes the ELF magic — otherwise text_crc_from_elf cannot parse
@@ -133,6 +151,23 @@ fn run() -> Result<()> {
                     vm.enable_smc(k, cfi_table);
                     k.iter_mut().for_each(|b| *b = 0);
                 }
+                // Integrity guard: periodic CRC of the mapped .text plus a
+                // TracerPid re-check, so live patching or a late attach is
+                // caught mid-run. Baseline is taken from the mapped bytes
+                // (post-loader) to avoid false positives on relocation.
+                if h.flags & shell_pack::protect::FLAG_ANTIDEBUG != 0 {
+                    let off = TEXT_FILE_OFF.load(Ordering::Relaxed);
+                    let len = TEXT_LEN.load(Ordering::Relaxed);
+                    if let Some((ptr, mlen)) = mapped_text_range(&exe, off, len) {
+                        let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, mlen) };
+                        TEXT_CRC.store(
+                            shell_pack::protect::crc32(slice) as usize,
+                            Ordering::Relaxed,
+                        );
+                        TEXT_PTR.store(ptr, Ordering::Relaxed);
+                        vm.set_guard(integrity_guard, 1 << 18);
+                    }
+                }
             }
             let mut argv = std::env::args();
             if let Some(arg0) = argv.next() {
@@ -149,23 +184,27 @@ fn run() -> Result<()> {
     bail!("no .shellsc section found — is this a valid .sc file?")
 }
 
-/// Refuse to run under a tracer (ptrace-based debugger / strace).
-/// Reads /proc/self/status via a raw syscall — an interposed libc
-/// `open`/`read` cannot fake the TracerPid line.
-fn antidebug_check() -> Result<()> {
+/// Read TracerPid via a raw syscall — an interposed libc
+/// `open`/`read` cannot fake the line.
+fn read_tracer_pid() -> Result<i64> {
     let status =
         unsafe { raw::raw_open_read("/proc/self/status").context("reading /proc/self/status")? };
     let text = String::from_utf8_lossy(&status);
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("TracerPid:") {
-            let pid: i64 = rest.trim().parse().context("parsing TracerPid")?;
-            if pid != 0 {
-                bail!("refusing to run under tracer (pid {pid})");
-            }
-            return Ok(());
+            return rest.trim().parse().context("parsing TracerPid");
         }
     }
     bail!("TracerPid not found in /proc/self/status")
+}
+
+/// Refuse to run under a tracer (ptrace-based debugger / strace).
+fn antidebug_check() -> Result<()> {
+    let pid = read_tracer_pid()?;
+    if pid != 0 {
+        bail!("refusing to run under tracer (pid {pid})");
+    }
+    Ok(())
 }
 
 /// Thread CPU time, not wall-clock: a descheduled or throttled process
@@ -287,11 +326,69 @@ fn selfdebug_check() -> Result<()> {
             raw::raw_exit_group(0);
         }
         raw::raw_close(pipefd[1] as usize);
+        SELFDEBUG_CHILD.store(pid as i32, Ordering::Relaxed);
         let mut buf = [0u8; 1];
         let _ = raw::raw_read(pipefd[0] as usize, &mut buf);
         raw::raw_close(pipefd[0] as usize);
     }
     Ok(())
+}
+
+/// Periodic VM guard: re-check TracerPid (catches attach-after-startup)
+/// and verify the mapped .text still matches the post-load baseline
+/// (catches live code patching). The self-debug child's pid is not a
+/// debugger. Returns nonzero to abort the VM.
+extern "C" fn integrity_guard() -> i32 {
+    if let Ok(pid) = read_tracer_pid() {
+        let expect = SELFDEBUG_CHILD.load(Ordering::Relaxed) as i64;
+        if pid != 0 && pid != expect {
+            return 1;
+        }
+    }
+    let ptr = TEXT_PTR.load(Ordering::Relaxed);
+    let len = TEXT_LEN.load(Ordering::Relaxed);
+    if ptr == 0 || len == 0 {
+        return 0;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    if shell_pack::protect::crc32(bytes) != TEXT_CRC.load(Ordering::Relaxed) as u32 {
+        return 1;
+    }
+    0
+}
+
+/// Locate the running process's mapped .text: find the executable's r-x
+/// mapping in /proc/self/maps and translate the section's file offset
+/// through that mapping's file offset. Best-effort — returns None if the
+/// layout cannot be resolved (guard then stays off).
+fn mapped_text_range(exe: &Path, file_off: usize, size: usize) -> Option<(usize, usize)> {
+    if file_off == 0 || size == 0 {
+        return None;
+    }
+    let maps = unsafe { raw::raw_open_read("/proc/self/maps") }?;
+    let maps = String::from_utf8_lossy(&maps);
+    let exe_s = exe.to_string_lossy();
+    for line in maps.lines() {
+        let mut it = line.split_whitespace();
+        let range = it.next()?;
+        let perms = it.next()?;
+        let off_s = it.next()?;
+        let path = it.last();
+        if perms.get(0..3) != Some("r-x") {
+            continue;
+        }
+        if !matches!(path, Some(p) if *p == *exe_s) {
+            continue;
+        }
+        let (start_s, _) = range.split_once('-')?;
+        let map_start = usize::from_str_radix(start_s, 16).ok()?;
+        let map_off = usize::from_str_radix(off_s, 16).ok()?;
+        if file_off < map_off {
+            continue;
+        }
+        return Some((map_start + (file_off - map_off), size));
+    }
+    None
 }
 
 /// Anti-dump hardening: lock .text in memory, exclude from core dumps,
