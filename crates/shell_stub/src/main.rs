@@ -97,6 +97,7 @@ fn run() -> Result<()> {
             let mut cfi_table: Option<Vec<u32>> = None;
 
             let mut bc_bytes: Vec<u8> = if is_protected {
+                eprintln!("Protected by ShellSC");
                 let header = shell_pack::ProtectHeader::from_bytes(payload)
                     .map_err(|e| anyhow::anyhow!("protect header: {}", e))?;
                 // PR_SET_DUMPABLE=0 makes the kernel deny reads of this
@@ -266,8 +267,16 @@ fn antihook_check() -> Result<()> {
         for kv in env.split(|b| *b == 0) {
             if let Ok(s) = std::str::from_utf8(kv) {
                 if let Some(v) = s.strip_prefix("LD_PRELOAD=") {
-                    if !v.trim().is_empty() {
-                        fail_silent();
+                    // Termux itself ships libtermux-exec.so (and similar
+                    // prefix libs) via LD_PRELOAD — allow every entry that
+                    // lives under the Termux prefix; refuse the rest.
+                    for entry in v.split(|c: char| c == ':' || c.is_whitespace()) {
+                        if entry.is_empty() {
+                            continue;
+                        }
+                        if !entry.contains("termux") {
+                            fail_silent();
+                        }
                     }
                 }
             }

@@ -65,7 +65,7 @@ Not supported: write-mode process substitution `>(cmd)`, associative arrays (`de
 
 ## Protection (`--protect`)
 
-Available on `build` and `pack`. Use `--all` to enable every protection at once (`--protect --smc --self-debug`). Protected binaries run silently; anti-tamper detections exit(1) with no diagnostic output, so failures are indistinguishable from ordinary script errors.
+Available on `build` and `pack`. Use `--all` to enable every protection at once (`--protect --smc --self-debug`). A protected `.sc` prints `Protected by ShellSC` as its first line when run. Anti-tamper detections exit(1) with no diagnostic output, so failures are indistinguishable from ordinary script errors. `LD_PRELOAD` entries living under the Termux prefix (e.g. `libtermux-exec.so`) are allowed; any other preload is refused.
 
 - XOR encryption of bytecode with per-build random key
 - Per-build opcode shuffling (Fisher-Yates)
