@@ -1,5 +1,16 @@
 use std::collections::{HashMap, HashSet};
 
+/// Saved state of one `VAR=val cmd` prefix assignment, restored after the
+/// command finishes.
+#[derive(Debug, Clone)]
+pub(crate) struct PrefixSave {
+    name: String,
+    /// Value before the prefix assignment (None = was unset).
+    prev: Option<String>,
+    /// Whether the name was exported before we temporarily exported it.
+    was_exported: bool,
+}
+
 /// `std::env::set_var` panics on values containing NUL. Bash truncates at
 /// the first NUL when exporting — do the same instead of aborting.
 fn safe_set_var(name: &str, value: &str) {
@@ -29,6 +40,8 @@ pub struct Env {
     arrays: Vec<HashMap<String, Vec<Option<String>>>>,
     /// Names exported to child processes (kept in sync with process env).
     exported: HashSet<String>,
+    /// Pending `VAR=val cmd` assignments awaiting restore.
+    pub(crate) prefix_stack: Vec<PrefixSave>,
 }
 
 impl Default for Env {
@@ -37,6 +50,7 @@ impl Default for Env {
             frames: vec![HashMap::new()],
             arrays: vec![HashMap::new()],
             exported: HashSet::new(),
+            prefix_stack: Vec::new(),
         }
     }
 }
@@ -54,6 +68,7 @@ impl Env {
             frames: vec![global],
             arrays: vec![HashMap::new()],
             exported,
+            prefix_stack: Vec::new(),
         }
     }
 
@@ -168,6 +183,47 @@ impl Env {
         let val = self.get(name).unwrap_or("").to_string();
         safe_set_var(name, &val);
         self.exported.insert(name.to_string());
+    }
+
+    /// Temporary assignment for `VAR=val cmd`: set the value (visible to the
+    /// command and its children via process env) while remembering the prior
+    /// state for `restore_prefixes()`.
+    pub fn set_prefix(&mut self, name: &str, value: String) {
+        let prev = self.get(name).map(|s| s.to_string());
+        let was_exported = self.exported.contains(name);
+        // Temporarily export so spawn() children inherit the value.
+        self.exported.insert(name.to_string());
+        self.set(name, value);
+        self.prefix_stack.push(PrefixSave {
+            name: name.to_string(),
+            prev,
+            was_exported,
+        });
+    }
+
+    /// Undo all pending prefix assignments (innermost first).
+    /// Call after the command that owned them finishes.
+    pub fn restore_prefixes(&mut self) {
+        while let Some(save) = self.prefix_stack.pop() {
+            // Bypass set()'s process-env sync; we manage the process env
+            // explicitly below according to save.was_exported.
+            self.exported.remove(save.name.as_str());
+            match save.prev {
+                Some(v) => {
+                    self.set(save.name.clone(), v);
+                }
+                None => {
+                    self.unset(&save.name);
+                }
+            }
+            if save.was_exported {
+                let val = self.get(save.name.as_str()).unwrap_or("").to_string();
+                safe_set_var(save.name.as_str(), &val);
+                self.exported.insert(save.name.clone());
+            } else {
+                std::env::remove_var(save.name.as_str());
+            }
+        }
     }
 
     // ── Expansion ─────────────────────────────────────────────────────────────
@@ -536,5 +592,47 @@ mod tests {
         assert_eq!(std::env::var(exported).as_deref(), Ok("v2"));
         std::env::remove_var(plain);
         std::env::remove_var(exported);
+    }
+
+    #[test]
+    fn prefix_assignment_visible_then_restored() {
+        // VAR=val cmd: child sees val via process env; after restore the
+        // shell's prior value (or unset) comes back.
+        let mut e = env();
+        let n = "shellsc_test_prefix_restore";
+        std::env::remove_var(n);
+        e.set_prefix(n, "TEMP".into());
+        assert_eq!(e.get(n), Some("TEMP"));
+        assert_eq!(std::env::var(n).as_deref(), Ok("TEMP"));
+        e.restore_prefixes();
+        assert_eq!(e.get(n), None);
+        // After restore, process env should be clean too.
+        assert_eq!(std::env::var(n), Err(std::env::VarError::NotPresent));
+
+        // Prior value survives; since OUTER was never exported, the process
+        // env stays clean after restore (bash: `x=outer; x=out1 sh -c ...`
+        // passes out1 to the child but the shell's own env never had x).
+        e.set(n, "OUTER");
+        e.set_prefix(n, "TEMP2".into());
+        assert_eq!(e.get(n), Some("TEMP2"));
+        assert_eq!(std::env::var(n).as_deref(), Ok("TEMP2"));
+        e.restore_prefixes();
+        assert_eq!(e.get(n), Some("OUTER"));
+        assert_eq!(std::env::var(n), Err(std::env::VarError::NotPresent));
+        std::env::remove_var(n);
+    }
+
+    #[test]
+    fn prefix_assignment_restores_exported_status() {
+        let mut e = env();
+        let n = "shellsc_test_prefix_export";
+        e.export(n, Some("OLD"));
+        e.set_prefix(n, "TEMP".into());
+        assert_eq!(std::env::var(n).as_deref(), Ok("TEMP"));
+        e.restore_prefixes();
+        // Still exported with the original value.
+        assert!(e.exported.contains(n));
+        assert_eq!(std::env::var(n).as_deref(), Ok("OLD"));
+        std::env::remove_var(n);
     }
 }

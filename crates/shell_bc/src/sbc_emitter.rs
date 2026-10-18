@@ -49,6 +49,10 @@ impl SbcEmitter {
                 out.push_str(&format!("SetVar {}\n", q(n)));
             }
 
+            IrOp::SetVarPrefix(n) => {
+                out.push_str(&format!("SetVarPrefix {}\n", q(n)));
+            }
+
             IrOp::Builtin(id, argc) => {
                 out.push_str(&format!("Builtin {} {}\n", id.name(), argc));
             }

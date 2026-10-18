@@ -427,9 +427,17 @@ impl Vm {
         };
         for i in insert.iter_mut() {
             if let Some(mode) = pool_ops(i) {
-                let v = i.operand;
+                let mut v = i.operand;
+                if i.op == Opcode::SetVar {
+                    // SetVarPrefix encodes flag in high bit; mask before remap.
+                    v &= 0x7FFF_FFFF;
+                }
                 if mode == 0 {
+                    let prefix = i.op == Opcode::SetVar && v != i.operand;
                     i.operand = pool_map[v as usize];
+                    if prefix {
+                        i.operand |= 0x8000_0000;
+                    }
                 } else {
                     let op_byte = v >> 24;
                     let idx = v & 0x00FF_FFFF;
@@ -549,7 +557,14 @@ impl Vm {
     /// Create a child VM for inline subshell pipeline execution. Shares the
     /// parent's SMC stream (still encrypted — the child decrypts its own
     /// instructions on demand, same as the parent).
-    fn new_child(bc: Bytecode, env: crate::env::Env, smc: Option<crate::smc::SmcStream>) -> Self {
+    fn new_child(
+        bc: Bytecode,
+        mut env: crate::env::Env,
+        smc: Option<crate::smc::SmcStream>,
+    ) -> Self {
+        // Child VMs (subshells, pipeline stages) must not inherit pending
+        // prefix assignments — the parent restores those after the command.
+        env.prefix_stack.clear();
         let mut vm = Self::new(bc);
         vm.env = env;
         vm.smc = smc;
@@ -728,9 +743,17 @@ impl Vm {
                     self.stack.push_str(vals.join(""));
                 }
                 Opcode::SetVar => {
-                    let name = self.pool_str(instr.operand)?;
+                    // High bit = SetVarPrefix (`VAR=val cmd`): set for the
+                    // command's duration, restore after the command finishes.
+                    let is_prefix = instr.operand & 0x8000_0000 != 0;
+                    let pool_idx = instr.operand & 0x7FFF_FFFF;
+                    let name = self.pool_str(pool_idx)?;
                     let value = self.stack.pop()?.into_string();
-                    self.env.set(name, value);
+                    if is_prefix {
+                        self.env.set_prefix(&name, value);
+                    } else {
+                        self.env.set(name, value);
+                    }
                     // Assignment-only statements have no exec op to consume
                     // an ambiguous-redirect flag — clear it here so it can't
                     // skip a later innocent command.
@@ -784,6 +807,7 @@ impl Vm {
                         // the FAIL status from DynRedir.
                         let _ = self.pop_n(argc)?;
                         self.drop_stmt_redirs();
+                        self.env.restore_prefixes();
                         continue;
                     }
 
@@ -812,6 +836,7 @@ impl Vm {
                             }
                         }
                         self.update_status(result.status);
+                        self.env.restore_prefixes();
                         if self.exec_terminated {
                             self.run_exit_trap();
                             return Ok(self.status);
@@ -877,9 +902,12 @@ impl Vm {
                         // Ambiguous redirect: argv drained, leave the FAIL
                         // status from DynRedir.
                         self.drop_stmt_redirs();
+                        self.env.restore_prefixes();
                         continue;
                     }
                     if self.pipeline_expected > 0 {
+                        // Collect mode: restore at PipeEnd after the whole
+                        // pipeline finishes — stages still need the env.
                         let mut redirs =
                             RedirSet::new(std::mem::take(&mut self.pipeline_pending_redirs));
                         redirs.src = self.bc.src.clone();
@@ -887,6 +915,7 @@ impl Vm {
                             .push(PipelineStage::External { argv, redirs });
                     } else if let Some(&entry_ip) = self.func_table.get(&argv[0]) {
                         self.call_function(entry_ip, &argv[1..])?;
+                        self.env.restore_prefixes();
                     } else if !self.capture_stack.is_empty() {
                         let redirs = self.take_redirs();
                         match self.run_external_capture(&argv, redirs) {
@@ -907,6 +936,7 @@ impl Vm {
                                 self.handle_exec_error(&argv[0], e);
                             }
                         }
+                        self.env.restore_prefixes();
                     } else {
                         let redirs = self.take_redirs();
                         let saved_specs = redirs.specs.clone();
@@ -930,6 +960,7 @@ impl Vm {
                                 self.handle_exec_error(&argv[0], e);
                             }
                         }
+                        self.env.restore_prefixes();
                     }
                 }
                 Opcode::ExecExternalBg => {
@@ -940,6 +971,7 @@ impl Vm {
                     let argv = self.pop_n(n)?;
                     if std::mem::take(&mut self.redir_failed) && self.pipeline_expected == 0 {
                         self.drop_stmt_redirs();
+                        self.env.restore_prefixes();
                         continue;
                     }
                     let redirs = self.take_redirs();
@@ -983,6 +1015,9 @@ impl Vm {
                     } else if let Err(e) = spawn_background(&argv, redirs) {
                         self.handle_exec_error(&argv[0], e);
                     }
+                    // Bash: `VAR=val cmd &` still applies the temp assignment
+                    // for the child, then undoes it in the parent immediately.
+                    self.env.restore_prefixes();
                     self.status = ExitStatus::OK;
                 }
 
@@ -1111,6 +1146,9 @@ impl Vm {
                         let segments = std::mem::take(&mut self.pipeline_segments);
                         let capture_mode = !self.capture_stack.is_empty();
                         let (status, out) = self.exec_pipeline(segments, capture_mode)?;
+                        // Prefix assignments from pipeline stages were live
+                        // for the whole pipeline; undo them now.
+                        self.env.restore_prefixes();
                         if capture_mode && !out.is_empty() {
                             self.write_out(&out);
                         }

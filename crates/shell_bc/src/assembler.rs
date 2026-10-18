@@ -52,6 +52,13 @@ impl Assembler {
                 let i = self.bc.const_pool.intern(&s);
                 self.push(Opcode::SetVar, i);
             }
+            // Temporary assignment `VAR=val cmd`: same opcode, high bit marks
+            // the value as command-scoped (VM restores it after the command).
+            "SetVarPrefix" => {
+                let s = self.req_str(instr, 0)?;
+                let i = self.bc.const_pool.intern(&s);
+                self.push(Opcode::SetVar, i | 0x8000_0000);
+            }
 
             "Builtin" => {
                 let name = self.req_str(instr, 0)?;

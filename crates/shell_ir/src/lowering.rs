@@ -180,7 +180,13 @@ impl Lowerer {
                 });
             } else {
                 self.lower_word_single_parts(&assign.value)?;
-                self.chunk.push(IrOp::SetVar(assign.name.clone()));
+                // `VAR=val cmd` — temporary prefix assignment. Plain
+                // `VAR=val` (no command) is a permanent shell variable.
+                if cmd.argv.is_empty() {
+                    self.chunk.push(IrOp::SetVar(assign.name.clone()));
+                } else {
+                    self.chunk.push(IrOp::SetVarPrefix(assign.name.clone()));
+                }
             }
         }
         if !cmd.local_arrays.is_empty() {

@@ -58,3 +58,25 @@ fn exported_assignment_reaches_process_env() {
     );
     std::env::remove_var("sc_e2e_exp");
 }
+
+#[test]
+fn prefix_assignment_passed_to_child_then_restored() {
+    // `VAR=val cmd` — the child must see val; the shell env must revert.
+    assert_eq!(
+        run("x=OUTER; x=TEMP sh -c '[ \"$x\" = TEMP ]'; [ \"$x\" = OUTER ]"),
+        0,
+        "prefix assignment must be visible to the child and restored after"
+    );
+}
+
+#[test]
+fn prefix_assignment_not_exported_before() {
+    // A variable that was never exported must not leak into the process env
+    // after a `VAR=val cmd` statement finishes.
+    run("sc_e2e_pre=V sh -c ':'");
+    assert_eq!(
+        std::env::var("sc_e2e_pre"),
+        Err(std::env::VarError::NotPresent),
+        "prefix assignment of a non-exported var must not persist in process env"
+    );
+}

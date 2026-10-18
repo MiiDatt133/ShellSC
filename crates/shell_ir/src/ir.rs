@@ -40,6 +40,11 @@ pub enum IrOp {
     PushArgs,
     ConcatN(usize),
     SetVar(String),
+    /// Temporary assignment preceding a command (`VAR=val cmd`).
+    /// Assembler encodes as Opcode::SetVar with operand | 0x8000_0000.
+    /// VM sets the var (visible to the command + its children) then
+    /// restores the previous value once the command finishes.
+    SetVarPrefix(String),
 
     Builtin(BuiltinId, usize),
 
