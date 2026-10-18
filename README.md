@@ -65,7 +65,7 @@ Not supported: write-mode process substitution `>(cmd)`, associative arrays (`de
 
 ## Protection (`--protect`)
 
-Available on `build` and `pack`. Use `--all` to enable every protection at once (`--protect --smc --self-debug`). A protected `.sc` prints `Protected by ShellSC` as its first line when run.
+Available on `build` and `pack`. Use `--all` to enable every protection at once (`--protect --smc --self-debug`). Protected binaries run silently; anti-tamper detections exit(1) with no diagnostic output, so failures are indistinguishable from ordinary script errors.
 
 - XOR encryption of bytecode with per-build random key
 - Per-build opcode shuffling (Fisher-Yates)
@@ -76,9 +76,11 @@ Available on `build` and `pack`. Use `--all` to enable every protection at once 
 - Control-flow flattening + opaque predicates
 - Virtualized dispatch obfuscation
 - Seeded-header masking (v4) — seeds stored XOR-masked with the stub `.text` CRC
-- Self-modifying bytecode (`--smc`) — decrypt one instruction at a time; chained keystream, per-process runtime salt, keystream generator picked per build from 4 shapes
+- Self-modifying bytecode (`--smc`) — decrypt one instruction at a time; chained keystream, per-process runtime salt over instructions *and* pool data (every run's ciphertext differs), keystream generator picked per build from 4 shapes, per-block CFI checksums
 - Anti-debug (TracerPid check) and anti-hook (LD_PRELOAD, hook-framework markers in `/proc/self/maps`), read via raw syscalls — a preloaded library cannot interpose them; LD_PRELOAD is read from the kernel's `/proc/self/environ` snapshot, which `unsetenv()` cannot clean
+- Timing gate — busy-loop CPU-time check catches single-step / instruction-count instrumentation
 - Self-debug (`--self-debug`) — child process ptrace-attaches the parent, taking the tracer slot
+- Live integrity guard — periodic CRC of the mapped `.text` plus TracerPid re-check during dispatch; catches attach-after-startup and live code patching
 - CRC32 integrity verification
 - Key derivation from stub `.text` — patching one byte of `.text` invalidates the key
 

@@ -605,15 +605,11 @@ pub fn open(
     // operate on the bare bytecode stream.
     let cfi = if header.flags & FLAG_SMC != 0 {
         if body.len() < 4 {
-            return Err(ShellError::IoError(
-                "binary tampered: cfi table truncated".into(),
-            ));
+            return Err(ShellError::IoError("invalid payload: cfi truncated".into()));
         }
         let n = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
         if n > (body.len() - 4) / 4 {
-            return Err(ShellError::IoError(
-                "binary tampered: cfi table truncated".into(),
-            ));
+            return Err(ShellError::IoError("invalid payload: cfi truncated".into()));
         }
         let tlen = 4 + n * 4;
         let table = body[4..tlen]
@@ -631,23 +627,18 @@ pub fn open(
     if header.flags & FLAG_OPMAP != 0 && seeds.opmap_seed != 0 {
         // Pre-v5 payloads were sealed with the host-word-size shuffle.
         let inv = opcode_inverse(seeds.opmap_seed, version < 5);
-        revert_opmap(&mut body, &inv).map_err(|_| {
-            ShellError::IoError("binary tampered: refuse to run modified executable".into())
-        })?;
+        revert_opmap(&mut body, &inv).map_err(|_| ShellError::IoError("invalid payload".into()))?;
     }
 
     // v7 operand polymorphism: undo the per-build operand mask before the
     // CRC check (the checksum covers the plain stream).
     if version >= 7 {
-        apply_operand_map(&mut body, seeds.operand_seed).map_err(|_| {
-            ShellError::IoError("binary tampered: refuse to run modified executable".into())
-        })?;
+        apply_operand_map(&mut body, seeds.operand_seed)
+            .map_err(|_| ShellError::IoError("invalid payload".into()))?;
     }
 
     if crc32(&body) != header.crc32 {
-        return Err(ShellError::IoError(
-            "binary tampered: refuse to run modified executable".into(),
-        ));
+        return Err(ShellError::IoError("invalid payload".into()));
     }
     if body.len() != header.orig_len as usize {
         return Err(ShellError::IoError("bytecode length mismatch".into()));
@@ -932,7 +923,7 @@ mod tests {
         let last = tampered.len() - 1;
         tampered[last] ^= 0xFF;
         let err = open(&tampered, 0).err().unwrap().to_string();
-        assert!(err.contains("tampered"), "{err}");
+        assert!(err.contains("invalid"), "{err}");
     }
 
     #[test]
@@ -964,7 +955,7 @@ mod tests {
         // A different .text CRC (e.g. patched stub) un-masks wrong seeds →
         // wrong permutation → CRC mismatch → tamper error.
         let err = open(&sealed, 0xBBBB_0002).err().unwrap().to_string();
-        assert!(err.contains("tampered"), "{err}");
+        assert!(err.contains("invalid"), "{err}");
     }
 
     #[test]
@@ -1053,10 +1044,7 @@ mod tests {
         let bc_bytes = sample_shbc();
         let sealed = seal(&bc_bytes, ProtectOptions::all(), 0xAAAA_0001).unwrap();
         let err = open(&sealed, 0xBBBB_0002).err().unwrap().to_string();
-        assert!(
-            err.contains("tampered") || err.contains("mismatch"),
-            "{err}"
-        );
+        assert!(err.contains("invalid") || err.contains("mismatch"), "{err}");
     }
 
     #[test]

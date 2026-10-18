@@ -653,9 +653,7 @@ impl Vm {
                 if self.guard_ctr & self.guard_mask == 0 {
                     if let Some(f) = self.guard_fn {
                         if f() != 0 {
-                            return Err(ShellError::BytecodeError(
-                                "memory integrity check failed".into(),
-                            ));
+                            return Err(ShellError::BytecodeError("execution aborted".into()));
                         }
                     }
                 }
@@ -4126,7 +4124,7 @@ mod guard_tests {
         let mut vm = two_instr_vm();
         vm.set_guard(failing_guard, 1);
         let err = vm.run().unwrap_err();
-        assert!(err.to_string().contains("integrity"), "{err}");
+        assert!(err.to_string().contains("aborted"), "{err}");
     }
 
     #[test]

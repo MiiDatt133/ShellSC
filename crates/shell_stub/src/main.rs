@@ -97,7 +97,6 @@ fn run() -> Result<()> {
             let mut cfi_table: Option<Vec<u32>> = None;
 
             let mut bc_bytes: Vec<u8> = if is_protected {
-                eprintln!("Protected by ShellSC");
                 let header = shell_pack::ProtectHeader::from_bytes(payload)
                     .map_err(|e| anyhow::anyhow!("protect header: {}", e))?;
                 // PR_SET_DUMPABLE=0 makes the kernel deny reads of this
@@ -115,8 +114,8 @@ fn run() -> Result<()> {
                 }
                 anti_dump_harden(&bytes);
                 let (bc, cfi) = shell_pack::open(payload, text_crc)
-                    .map_err(|e| anyhow::anyhow!("unsealing bytecode: {}", e))?
-                    .context("protected payload too short")?;
+                    .map_err(|_| anyhow::anyhow!("invalid payload"))?
+                    .context("invalid payload")?;
                 cfi_table = cfi;
                 header_opt = Some(header);
                 bc
@@ -124,8 +123,8 @@ fn run() -> Result<()> {
                 payload.to_vec()
             };
 
-            let bc = Bytecode::from_bytes(&bc_bytes)
-                .map_err(|e| anyhow::anyhow!("deserializing bytecode: {}", e))?;
+            let bc =
+                Bytecode::from_bytes(&bc_bytes).map_err(|_| anyhow::anyhow!("invalid bytecode"))?;
             // Scrub the plaintext bytecode buffer — an attacker dumping
             // heap pages must not find the open stream intact.
             bc_bytes.fill(0);
@@ -181,7 +180,14 @@ fn run() -> Result<()> {
         }
     }
 
-    bail!("no .shellsc section found — is this a valid .sc file?")
+    bail!("not a valid executable")
+}
+
+/// Anti-tamper detections exit silently with a generic code: no stderr, no
+/// distinct exit status. An attacker cannot tell which check fired — or
+/// whether the failure is even a protection and not a script error.
+fn fail_silent() -> ! {
+    std::process::exit(1);
 }
 
 /// Read TracerPid via a raw syscall — an interposed libc
@@ -199,10 +205,13 @@ fn read_tracer_pid() -> Result<i64> {
 }
 
 /// Refuse to run under a tracer (ptrace-based debugger / strace).
+/// Fail-open if /proc is unreadable — the kernel always exposes it to
+/// self, so a failure here is not a debugger signal.
 fn antidebug_check() -> Result<()> {
-    let pid = read_tracer_pid()?;
-    if pid != 0 {
-        bail!("refusing to run under tracer (pid {pid})");
+    if let Ok(pid) = read_tracer_pid() {
+        if pid != 0 {
+            fail_silent();
+        }
     }
     Ok(())
 }
@@ -242,7 +251,7 @@ fn timing_anomaly_check() -> Result<()> {
     }
     let elapsed = end.saturating_sub(start);
     if elapsed > 500_000_000 {
-        bail!("timing check failed ({elapsed} ns) — traced or emulated");
+        fail_silent();
     }
     Ok(())
 }
@@ -258,18 +267,20 @@ fn antihook_check() -> Result<()> {
             if let Ok(s) = std::str::from_utf8(kv) {
                 if let Some(v) = s.strip_prefix("LD_PRELOAD=") {
                     if !v.trim().is_empty() {
-                        bail!("refusing to run with LD_PRELOAD set");
+                        fail_silent();
                     }
                 }
             }
         }
     }
-    let maps = unsafe { raw::raw_open_read("/proc/self/maps").context("reading /proc/self/maps")? };
-    const HOOK_MARKERS: [&str; 6] = ["frida", "gadget", "xposed", "substrate", "lsposed", "cydia"];
-    let maps_lower = String::from_utf8_lossy(&maps).to_lowercase();
-    for m in HOOK_MARKERS {
-        if maps_lower.contains(m) {
-            bail!("refusing to run: hook framework marker '{m}' in memory map");
+    if let Some(maps) = unsafe { raw::raw_open_read("/proc/self/maps") } {
+        const HOOK_MARKERS: [&str; 6] =
+            ["frida", "gadget", "xposed", "substrate", "lsposed", "cydia"];
+        let maps_lower = String::from_utf8_lossy(&maps).to_lowercase();
+        for m in HOOK_MARKERS {
+            if maps_lower.contains(m) {
+                fail_silent();
+            }
         }
     }
     Ok(())
@@ -285,11 +296,11 @@ fn selfdebug_check() -> Result<()> {
     unsafe {
         let mut pipefd = [0i32; 2];
         if raw::raw_pipe(&mut pipefd) < 0 {
-            bail!("self-debug: pipe failed");
+            fail_silent();
         }
         let pid = raw::raw_fork();
         if pid < 0 {
-            bail!("self-debug: fork failed");
+            fail_silent();
         }
         if pid == 0 {
             raw::raw_close(pipefd[0] as usize);
@@ -337,12 +348,12 @@ fn selfdebug_check() -> Result<()> {
 /// Periodic VM guard: re-check TracerPid (catches attach-after-startup)
 /// and verify the mapped .text still matches the post-load baseline
 /// (catches live code patching). The self-debug child's pid is not a
-/// debugger. Returns nonzero to abort the VM.
+/// debugger. Detections exit silently — the caller only ever sees 0.
 extern "C" fn integrity_guard() -> i32 {
     if let Ok(pid) = read_tracer_pid() {
         let expect = SELFDEBUG_CHILD.load(Ordering::Relaxed) as i64;
         if pid != 0 && pid != expect {
-            return 1;
+            fail_silent();
         }
     }
     let ptr = TEXT_PTR.load(Ordering::Relaxed);
@@ -352,7 +363,7 @@ extern "C" fn integrity_guard() -> i32 {
     }
     let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
     if shell_pack::protect::crc32(bytes) != TEXT_CRC.load(Ordering::Relaxed) as u32 {
-        return 1;
+        fail_silent();
     }
     0
 }
