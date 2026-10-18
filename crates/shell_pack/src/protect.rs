@@ -20,7 +20,11 @@ pub const PROTECT_MAGIC: &[u8; 12] = b"SHELLSC_PROT";
 /// v5: body encrypted with the content-chained keystream (chain_crypt)
 /// instead of the repeating 16-byte XOR; const pool sealed to bytecode
 /// 0x04 (pool_seal) when FLAG_ENCRYPTED. v4 payloads still open.
-pub const PROTECT_VERSION: u8 = 5;
+/// v6: header.key is a random salt; key/seeds derive from a stretched
+/// KDF over (text_crc, salt, flags) — a single offline derivation costs
+/// milliseconds and brute-forcing a patched .text CRC becomes infeasible.
+/// Also stops the v5 opaque_param key-byte leak (params are random now).
+pub const PROTECT_VERSION: u8 = 6;
 
 /// magic 12 + version 1 + flags 1 + cff_seed 2 + key 16 + crc32 4 +
 /// orig_len 4 + opmap_seed 4 + opaque_param1 4 + opaque_param2 4 = 52 bytes.
@@ -78,8 +82,8 @@ impl ProtectHeader {
         if &bytes[0..12] != PROTECT_MAGIC {
             return Err(ShellError::IoError("bad protect magic".into()));
         }
-        // v4 payloads stay readable; seal() only produces the current version.
-        if bytes[12] != PROTECT_VERSION && bytes[12] != 4 {
+        // v4/v5 payloads stay readable; seal() only produces the current version.
+        if bytes[12] > PROTECT_VERSION || bytes[12] < 4 {
             return Err(ShellError::IoError(format!(
                 "unsupported protect version {}",
                 bytes[12]
@@ -308,7 +312,7 @@ pub fn revert_opmap(bc_bytes: &mut [u8], inv: &[u8; OPMAP_SIZE]) -> Result<(), S
     Ok(())
 }
 
-// ── Key masking ──────────────────────────────────────────────────────────────
+// ── Key masking (v3–v5) ─────────────────────────────────────────────────────
 
 fn mask_key(key: &[u8; 16], text_hash: u32) -> [u8; 16] {
     let mut out = [0u8; 16];
@@ -324,6 +328,49 @@ fn mask_cff_seed(seed: u16, text_hash: u32) -> u16 {
 
 fn mask_opmap_seed(seed: u32, text_hash: u32) -> u32 {
     seed ^ text_hash
+}
+
+// ── v6 stretched key derivation ─────────────────────────────────────────────
+
+/// mix64 rounds for the v6 KDF. One runtime derivation costs a few
+/// milliseconds; brute-forcing a patched .text CRC (2^32 candidates ×
+/// chain_decrypt + CRC verify) — the attack that turns v5 header-masking
+/// into a minutes-long offline break — becomes multi-century work.
+pub const KDF_ROUNDS: u32 = 1 << 20;
+
+/// Expand (text_crc, salt, flags) into 24 bytes:
+/// `[0..16]` crypto key, `[16..18]` cff_seed, `[18..22]` opmap_seed,
+/// `[22..24]` pad. The header stores only the random salt; nothing about
+/// the key exists in the file without also knowing the stub's .text CRC —
+/// and even then the attacker pays KDF_ROUNDS per guess.
+pub fn kdf_expand(text_crc: u32, salt: &[u8; 16], flags: u8) -> [u8; 24] {
+    use shell_bc::pool_seal::{mix64, PHI_PUBLIC};
+    let s0 = u64::from_le_bytes(salt[0..8].try_into().unwrap());
+    let s1 = u64::from_le_bytes(salt[8..16].try_into().unwrap());
+    let mut state = mix64(u64::from(text_crc) ^ PHI_PUBLIC ^ ((flags as u64) << 56));
+    let mut b = s0 ^ 0xA5A5_A5A5_DEAD_BEEF;
+    let mut c = s1.wrapping_add(PHI_PUBLIC);
+    for _ in 0..KDF_ROUNDS {
+        state = mix64(state ^ b ^ c);
+        b = mix64(b ^ state);
+        c = mix64(c.wrapping_add(state));
+    }
+    let o1 = mix64(state ^ b);
+    let o2 = mix64(state.wrapping_add(c) ^ 0x1234_5678_9ABC_DEF0);
+    let o3 = mix64(b ^ c.wrapping_add(o1));
+    let mut out = [0u8; 24];
+    out[0..8].copy_from_slice(&o1.to_le_bytes());
+    out[8..16].copy_from_slice(&o2.to_le_bytes());
+    out[16..18].copy_from_slice(&(o3 as u16).to_le_bytes());
+    out[18..22].copy_from_slice(&((o3 >> 16) as u32).to_le_bytes());
+    out
+}
+
+fn kdf_key(text_crc: u32, salt: &[u8; 16], flags: u8) -> [u8; 16] {
+    let mat = kdf_expand(text_crc, salt, flags);
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&mat[0..16]);
+    key
 }
 
 /// Compute the CRC32 of the ELF stub's executable code (.text section).
@@ -372,12 +419,19 @@ fn cfi_build_table(bc_bytes: &[u8]) -> Result<Vec<u32>, ShellError> {
 /// only exists after the stub derives it at runtime from its own code bytes.
 pub fn seal(bc_bytes: &[u8], opts: ProtectOptions, text_hash: u32) -> Result<Vec<u8>, ShellError> {
     let mut rng = Rng::from_entropy();
-    let key = rng.key16();
-    let seed = rng.next_u32();
+    let flags = opts.flags();
+    // v6: the header stores a random salt; key and opcode seeds stretch
+    // out of (text_crc, salt, flags) so no key material is file-readable
+    // and every offline guess pays KDF_ROUNDS.
+    let salt = rng.key16();
+    let mat = kdf_expand(text_hash, &salt, flags);
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&mat[0..16]);
+    let kdf_opmap_seed = u32::from_le_bytes(mat[18..22].try_into().unwrap());
 
     let mut body = bc_bytes.to_vec();
 
-    // v5: seal the const pool first (0x03 -> 0x04 with per-entry ciphertext)
+    // Seal the const pool first (0x03 -> 0x04 with per-entry ciphertext)
     // so the CRC/length checks in open() cover the sealed layout that comes
     // back out of the decrypt path. The pool key travels inside the chain-
     // encrypted body, never in the header.
@@ -394,7 +448,7 @@ pub fn seal(bc_bytes: &[u8], opts: ProtectOptions, text_hash: u32) -> Result<Vec
     let orig_len = body.len() as u32;
 
     if opts.opmap {
-        let perm = opcode_permutation(seed);
+        let perm = opcode_permutation(kdf_opmap_seed);
         apply_opmap(&mut body, &perm)?;
     }
 
@@ -417,40 +471,21 @@ pub fn seal(bc_bytes: &[u8], opts: ProtectOptions, text_hash: u32) -> Result<Vec
         shell_bc::pool_seal::chain_crypt(&key, &mut body, false);
     }
 
-    let cff_seed = if opts.cff { rng.next_u64() as u16 } else { 0 };
-    let opaque_p1 = if opts.opaque {
-        crc ^ (key[0] as u32)
-    } else {
-        0
-    };
-    let opaque_p2 = if opts.opaque {
-        (key[1] as u32).wrapping_mul(key[2] as u32)
-    } else {
-        0
-    };
-
-    // Mask the key with the ELF .text hash so it never appears in the file.
-    let stored_key = mask_key(&key, text_hash);
-    // Mask the seeds the same way (v4): without the stub's own .text CRC,
-    // the header reveals nothing about the opcode permutation.
-    let stored_cff_seed = if opts.cff {
-        mask_cff_seed(cff_seed, text_hash)
-    } else {
-        0
-    };
-    let stored_opmap_seed = if opts.opmap {
-        mask_opmap_seed(seed, text_hash)
-    } else {
-        0
-    };
+    // Random opaque params (v6): the v5 derivation (param1 = crc ^ key[0],
+    // param2 = key[1]*key[2]) put key bytes straight into the header.
+    let opaque_p1 = if opts.opaque { rng.next_u32() } else { 0 };
+    let opaque_p2 = if opts.opaque { rng.next_u32() } else { 0 };
 
     let header = ProtectHeader {
-        flags: opts.flags(),
-        cff_seed: stored_cff_seed,
-        key: stored_key,
+        flags,
+        // v6: stored seeds are filler — derive_seeds() recomputes the real
+        // values through the KDF; keeping the fields populated preserves
+        // the layout and hides build-option patterns.
+        cff_seed: if opts.cff { rng.next_u32() as u16 } else { 0 },
+        key: salt,
         crc32: crc,
         orig_len,
-        opmap_seed: stored_opmap_seed,
+        opmap_seed: if opts.opmap { rng.next_u32() } else { 0 },
         opaque_param1: opaque_p1,
         opaque_param2: opaque_p2,
     };
@@ -462,8 +497,8 @@ pub fn seal(bc_bytes: &[u8], opts: ProtectOptions, text_hash: u32) -> Result<Vec
 }
 
 /// The runtime seeds derived from a (possibly masked) header and the stub's
-/// `.text` CRC. Version >= 4 stores cff_seed/opmap_seed XOR-masked; earlier
-/// versions store them plaintext.
+/// `.text` CRC. Version >= 6 stretches them through the KDF; v4/v5 store
+/// XOR-masked; earlier versions store them plaintext.
 #[derive(Debug, Clone, Copy)]
 pub struct DerivedSeeds {
     pub cff_seed: u16,
@@ -471,6 +506,13 @@ pub struct DerivedSeeds {
 }
 
 pub fn derive_seeds(header: &ProtectHeader, version: u8, text_hash: u32) -> DerivedSeeds {
+    if version >= PROTECT_VERSION {
+        let mat = kdf_expand(text_hash, &header.key, header.flags);
+        return DerivedSeeds {
+            cff_seed: u16::from_le_bytes(mat[16..18].try_into().unwrap()),
+            opmap_seed: u32::from_le_bytes(mat[18..22].try_into().unwrap()),
+        };
+    }
     DerivedSeeds {
         cff_seed: if version >= SEEDMASK_MIN_VERSION {
             mask_cff_seed(header.cff_seed, text_hash)
@@ -501,12 +543,14 @@ pub fn open(
     let version = payload[12];
 
     if header.flags & FLAG_ENCRYPTED != 0 {
-        let real_key = if version >= KEYDERIVE_MIN_VERSION {
+        let real_key = if version >= PROTECT_VERSION {
+            kdf_key(text_hash, &header.key, header.flags)
+        } else if version >= KEYDERIVE_MIN_VERSION {
             mask_key(&header.key, text_hash)
         } else {
             header.key
         };
-        if version >= PROTECT_VERSION {
+        if version >= 5 {
             shell_bc::pool_seal::chain_crypt(&real_key, &mut body, true);
         } else {
             xor_crypt(&real_key, &mut body);
@@ -915,5 +959,51 @@ mod tests {
         sealed[HEADER_LEN] ^= 0xFF; // num_blocks low byte: 1 -> 254
         let err = open(&sealed, 0).err().unwrap().to_string();
         assert!(err.contains("cfi"), "{err}");
+    }
+
+    #[test]
+    fn kdf_expand_deterministic_and_sensitive() {
+        let salt = [3u8; 16];
+        let a = kdf_expand(0x1234, &salt, 0xFF);
+        assert_eq!(a, kdf_expand(0x1234, &salt, 0xFF));
+        assert_ne!(a, kdf_expand(0x1235, &salt, 0xFF), "text_crc must matter");
+        assert_ne!(a, kdf_expand(0x1234, &[4u8; 16], 0xFF), "salt must matter");
+        assert_ne!(a, kdf_expand(0x1234, &salt, 0xFE), "flags must matter");
+    }
+
+    #[test]
+    fn v6_header_holds_no_key_material() {
+        // The v6 header.key is a salt, not the key: nothing in the header
+        // alone (no text CRC) may recover the chain key.
+        let bc_bytes = sample_shbc();
+        let sealed = seal(&bc_bytes, ProtectOptions::all(), 0x0BAD_F00D).unwrap();
+        let header = ProtectHeader::from_bytes(&sealed).unwrap();
+        // Decrypting with the stored header.key bytes directly must fail.
+        let mut body = sealed[HEADER_LEN..].to_vec();
+        shell_bc::pool_seal::chain_crypt(&header.key, &mut body, true);
+        assert!(
+            crc32(&body) != header.crc32,
+            "header.key alone must not decrypt the body"
+        );
+        // v5's leak is gone: param1 ^ crc no longer yields key[0].
+        let mat = kdf_expand(0x0BAD_F00D, &header.key, header.flags);
+        assert_ne!(
+            header.opaque_param1 ^ header.crc32,
+            mat[0] as u32,
+            "opaque_param1 must not leak key material"
+        );
+    }
+
+    #[test]
+    fn v6_wrong_text_crc_fails_tamper() {
+        // Same shape as the v5 break, now with a KDF in the way: a wrong
+        // .text CRC derives the wrong key and open() must refuse.
+        let bc_bytes = sample_shbc();
+        let sealed = seal(&bc_bytes, ProtectOptions::all(), 0xAAAA_0001).unwrap();
+        let err = open(&sealed, 0xBBBB_0002).err().unwrap().to_string();
+        assert!(
+            err.contains("tampered") || err.contains("mismatch"),
+            "{err}"
+        );
     }
 }

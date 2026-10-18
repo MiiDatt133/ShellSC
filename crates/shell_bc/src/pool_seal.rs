@@ -10,6 +10,9 @@ use shell_ast::ShellError;
 
 const PHI: u64 = 0x9E37_79B9_7F4A_7C15;
 
+/// Golden-ratio constant shared with shell_pack's v6 KDF.
+pub const PHI_PUBLIC: u64 = PHI;
+
 pub const POOL_SEAL_VERSION: u8 = 0x04;
 
 pub fn mix64(mut x: u64) -> u64 {
