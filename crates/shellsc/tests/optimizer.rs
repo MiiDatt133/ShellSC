@@ -105,7 +105,7 @@ fn case_fallthrough_jump_lands_on_funcdef() {
         .iter()
         .position(|l| l.starts_with("FuncDef"))
         .expect("FuncDef missing");
-    for (i, l) in lines.iter().enumerate() {
+    for (_i, l) in lines.iter().enumerate() {
         if l.starts_with("Jmp ") {
             let target: usize = l.split_whitespace().nth(1).unwrap().parse().unwrap();
             assert_eq!(

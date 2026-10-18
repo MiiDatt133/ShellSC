@@ -124,6 +124,7 @@ impl Assembler {
                             kind: entry.kind,
                             fd: entry.fd,
                             target: RedirTarget::File(idx),
+                            line: entry.line,
                         }
                     }
                     _ => entry,
@@ -162,6 +163,10 @@ impl Assembler {
             "SubshellEnd" => {
                 self.push_bare(Opcode::SubshellEnd);
             }
+            "SubshellBgEnd" => {
+                let body_ip = self.req_uint(instr, 0)?;
+                self.push(Opcode::SubshellBgEnd, body_ip);
+            }
             "GlobExpand" => {
                 self.push_bare(Opcode::GlobExpand);
             }
@@ -186,6 +191,10 @@ impl Assembler {
                 let fd = self.req_uint(instr, 1)?;
                 let operand = (kind_byte << 24) | (fd & 0x00FF_FFFF);
                 self.push(Opcode::DynRedir, operand);
+            }
+            "DynRedirLine" => {
+                let line = self.req_uint(instr, 0)?;
+                self.push(Opcode::DynRedirLine, line);
             }
             "BashUnary" => {
                 let op = self.req_str(instr, 0)?;

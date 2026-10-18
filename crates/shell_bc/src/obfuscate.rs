@@ -134,7 +134,11 @@ fn substitute_consts(bc: &mut Bytecode, seed: u32) {
     for ins in out.iter_mut() {
         if matches!(
             ins.op,
-            Opcode::Jmp | Opcode::JmpIfFail | Opcode::JmpIfOk | Opcode::PipeSubshellBegin
+            Opcode::Jmp
+                | Opcode::JmpIfFail
+                | Opcode::JmpIfOk
+                | Opcode::PipeSubshellBegin
+                | Opcode::SubshellBgEnd
         ) {
             ins.operand = label_map[ins.operand as usize];
         }
@@ -223,7 +227,11 @@ fn bogus_control_flow(bc: &mut Bytecode, seed: u32) {
     for ins in out.iter_mut() {
         if matches!(
             ins.op,
-            Opcode::Jmp | Opcode::JmpIfFail | Opcode::JmpIfOk | Opcode::PipeSubshellBegin
+            Opcode::Jmp
+                | Opcode::JmpIfFail
+                | Opcode::JmpIfOk
+                | Opcode::PipeSubshellBegin
+                | Opcode::SubshellBgEnd
         ) {
             ins.operand = label_map[ins.operand as usize];
         }
@@ -301,7 +309,11 @@ fn cond_double_neg(bc: &mut Bytecode, seed: u32) {
     for ins in out.iter_mut() {
         if matches!(
             ins.op,
-            Opcode::Jmp | Opcode::JmpIfFail | Opcode::JmpIfOk | Opcode::PipeSubshellBegin
+            Opcode::Jmp
+                | Opcode::JmpIfFail
+                | Opcode::JmpIfOk
+                | Opcode::PipeSubshellBegin
+                | Opcode::SubshellBgEnd
         ) {
             ins.operand = label_map[ins.operand as usize];
         }
@@ -347,7 +359,11 @@ fn arith_neutral(bc: &mut Bytecode, seed: u32) {
     for ins in out.iter_mut() {
         if matches!(
             ins.op,
-            Opcode::Jmp | Opcode::JmpIfFail | Opcode::JmpIfOk | Opcode::PipeSubshellBegin
+            Opcode::Jmp
+                | Opcode::JmpIfFail
+                | Opcode::JmpIfOk
+                | Opcode::PipeSubshellBegin
+                | Opcode::SubshellBgEnd
         ) {
             ins.operand = label_map[ins.operand as usize];
         }

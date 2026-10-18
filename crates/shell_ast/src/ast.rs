@@ -368,3 +368,16 @@ pub fn stub_arith_sub(_span: Span) -> Result<WordPart, ShellError> {
 pub fn stub_var_expand(_span: Span) -> Result<WordPart, ShellError> {
     Err(ShellError::not_implemented("variable expansion"))
 }
+
+/// A heredoc whose delimiter was never found: the body ran to end-of-file.
+/// Carried from the lexer through the bytecode to the VM, which prints the
+/// bash-style warning up front (bash parses the whole file before running).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeredocWarning {
+    /// Line of the `<<` operator.
+    pub line: u32,
+    /// Line the EOF was hit on (line number of the file's last byte).
+    pub eof_line: u32,
+    /// Delimiter that was wanted.
+    pub delim: String,
+}

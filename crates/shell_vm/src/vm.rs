@@ -17,7 +17,7 @@ use crate::{
     sys::{
         pipe::{run_builtin_stage_for_vm, run_external_stage_inline, PipelineStage},
         proc::{spawn_background, spawn_command},
-        redir::{RedirSet, RedirSpec, RedirTargetSpec},
+        redir::{io_short, redir_msg, RedirSet, RedirSpec, RedirTargetSpec},
     },
 };
 
@@ -62,9 +62,14 @@ pub struct Vm {
     capture_stack: Vec<Vec<u8>>,
     /// Saved envs for subshell isolation (push on SubshellBegin, pop on SubshellEnd).
     subshell_envs: Vec<crate::env::Env>,
+    /// Saved envs for command-substitution isolation. `$(...)` runs in a
+    /// subshell, so assignments inside it must not survive into the caller.
+    cmdsub_envs: Vec<crate::env::Env>,
     /// Extra stack slots pushed by GlobExpand beyond the 1-slot-per-word compile-time count.
     /// Consumed and reset to 0 by ExecExternal and Builtin.
     glob_surplus: usize,
+    /// Source line announced by the preceding DynRedirLine instruction.
+    dyn_redir_line: u32,
     /// Slots withheld by PushArgs when there are zero positionals — the
     /// compiled 1-slot assumption must be undone by the next consumer.
     glob_deficit: usize,
@@ -74,8 +79,9 @@ pub struct Vm {
     redir_failed: bool,
     /// Stdin data piped from a previous pipeline stage (consumed line-by-line by `read`).
     pending_stdin: Option<std::io::Cursor<Vec<u8>>>,
-    /// Background function-call child VMs — `wait` joins them all.
-    bg_handles: Vec<std::thread::JoinHandle<()>>,
+    /// Background child VMs (function calls and `( ... ) &`) — `wait` joins
+    /// them all and adopts the last one's exit status.
+    bg_handles: Vec<std::thread::JoinHandle<i32>>,
     /// Receiver of the last spawned bg child's done-signal (spawn-order chaining).
     bg_chain: Option<std::sync::mpsc::Receiver<()>>,
     /// When set, run() stops when ip reaches this value (used for inline subshell stages).
@@ -110,13 +116,13 @@ pub struct Vm {
     /// is transformed through a seeded bijection before the dispatch match,
     /// so a static disassembler cannot map match arms back to opcodes.
     cff_active: bool,
-    /// Per-build permutation of opcode bytes 0x01..=0x2D applied at dispatch
+    /// Per-build permutation of opcode bytes 0x01..=0x2F applied at dispatch
     /// time: the decoded opcode is permuted before the match, so a memory
     /// dump of the bytecode does not directly reveal which handler runs.
-    cff_decode: [u8; 45],
+    cff_decode: [u8; 47],
     /// Inverse of cff_decode: slot_decode[slot] = original opcode index.
     /// Used for virtualized dispatch verification.
-    slot_decode: [u8; 45],
+    slot_decode: [u8; 47],
     /// Per-build key for virtualized dispatch XOR verification.
     virt_key: u32,
     /// Opaque-predicate params (always-true guards derived from the protect
@@ -152,7 +158,9 @@ impl Vm {
             func_table: HashMap::new(),
             capture_stack: vec![],
             subshell_envs: vec![],
+            cmdsub_envs: vec![],
             glob_surplus: 0,
+            dyn_redir_line: 0,
             glob_deficit: 0,
             redir_failed: false,
             pending_stdin: None,
@@ -172,8 +180,8 @@ impl Vm {
             exec_terminated: false,
             for_exit_status: None,
             cff_active: false,
-            cff_decode: [0; 45],
-            slot_decode: [0; 45],
+            cff_decode: [0; 47],
+            slot_decode: [0; 47],
             virt_key: 0,
             opaque_p1: 0,
             opaque_p2: 0,
@@ -193,9 +201,9 @@ impl Vm {
         // Poly VM: the seed also picks which predicate/decoy shapes this
         // build's dispatch guard uses.
         self.poly_variant = (cff_seed & 3) as u8;
-        // Fisher-Yates permutation of opcode bytes 0x01..=0x2D, derived
+        // Fisher-Yates permutation of opcode bytes 0x01..=0x2F, derived
         // deterministically from the seed so the stub and VM agree.
-        let mut perm: [u8; 45] = (1u8..=45).collect::<Vec<u8>>().try_into().unwrap();
+        let mut perm: [u8; 47] = (1u8..=47).collect::<Vec<u8>>().try_into().unwrap();
         let mut rng_state = (cff_seed as u32).wrapping_mul(CFF_PERM_MULT) | 1;
         let mut i = perm.len();
         while i > 1 {
@@ -208,7 +216,7 @@ impl Vm {
         }
         self.cff_decode = perm;
         // Build inverse permutation for virtualized dispatch verification.
-        let mut inv = [0u8; 45];
+        let mut inv = [0u8; 47];
         for (i, &v) in perm.iter().enumerate() {
             inv[(v - 1) as usize] = i as u8;
         }
@@ -229,11 +237,13 @@ impl Vm {
             })
             .collect();
         let pool: Vec<String> = std::mem::take(&mut self.bc.const_pool.strings);
+        self.bc.const_pool.index.clear();
         let redirs: Vec<SmcRedir> = std::mem::take(&mut self.bc.redirs)
             .into_iter()
             .map(|r| SmcRedir {
                 kind: r.kind.to_u8(),
                 fd: r.fd,
+                line: r.line,
                 target: match r.target {
                     RedirTarget::File(pi) => SmcTarget::File(pi),
                     RedirTarget::Fd(n) => SmcTarget::Fd(n),
@@ -281,6 +291,11 @@ impl Vm {
     /// in the existing stream shift by the inserted length. With SMC on,
     /// the program is unsealed, spliced in plaintext, and re-sealed.
     fn splice_bytecode(&mut self, bc: Bytecode) -> Result<(), ShellError> {
+        // Source-line metadata lives outside the sealed pieces; carry it
+        // across the unseal/replace below.
+        let keep_src = self.bc.src.clone();
+        let keep_warns = self.bc.heredoc_warns.clone();
+        let keep_key = self.bc.const_pool.key;
         // Unseal SMC to plaintext form so one splice path serves both modes.
         // The re-seal key is retained so `eval` under --smc keeps the same
         // key (a fresh one would be fine too, but this avoids carrying a
@@ -302,12 +317,17 @@ impl Vm {
                     })
                     .collect();
                 plain.const_pool.strings = parts.pool;
+                // Pool-sealed streams keep their key across unseal/splice:
+                // strings stay hex until pool_str opens them.
+                plain.const_pool.key = self.bc.const_pool.key;
+                plain.const_pool.rebuild_index();
                 plain.redirs = parts
                     .redirs
                     .into_iter()
                     .map(|r| shell_bc::bytecode::RedirEntry {
                         kind: RedirKind::from_u8(r.kind).unwrap_or(RedirKind::Out),
                         fd: r.fd,
+                        line: r.line,
                         target: match r.target {
                             crate::smc::SmcTarget::File(pi) => RedirTarget::File(pi),
                             crate::smc::SmcTarget::Fd(n) => RedirTarget::Fd(n),
@@ -487,6 +507,7 @@ impl Vm {
                 .map(|r| SmcRedir {
                     kind: r.kind.to_u8(),
                     fd: r.fd,
+                    line: r.line,
                     target: match &r.target {
                         RedirTarget::File(pi) => SmcTarget::File(*pi),
                         RedirTarget::Fd(n) => SmcTarget::Fd(*n),
@@ -514,6 +535,11 @@ impl Vm {
                 // being sealed (the build-time table no longer covers them).
                 None,
             ));
+            // The plaintext `cur` never reaches self.bc in SMC mode — restore
+            // the metadata (and pool key) that outlives the seal.
+            self.bc.src = keep_src;
+            self.bc.heredoc_warns = keep_warns;
+            self.bc.const_pool.key = keep_key;
         } else {
             self.bc = cur;
         }
@@ -570,6 +596,18 @@ impl Vm {
     }
 
     pub fn run(&mut self) -> Result<ExitStatus, ShellError> {
+        // bash parses the whole file before running: unterminated-heredoc
+        // warnings are printed up front, before any script output.
+        let warns = std::mem::take(&mut self.bc.heredoc_warns);
+        for w in warns {
+            eprint!(
+                "{}: line {}: warning: here-document at line {} delimited by end-of-file (wanted `{}')\n",
+                self.bc.src, w.eof_line, w.line, w.delim
+            );
+        }
+        // Read once: std::env::var_os is a lock + hash lookup — too costly
+        // per-instruction in the dispatch loop.
+        let trace = std::env::var_os("SHELLSC_TRACE").is_some();
         while self.ip < self.instr_count() {
             if let Some(fence) = self.ip_fence {
                 if self.ip >= fence {
@@ -650,6 +688,14 @@ impl Vm {
             } else {
                 instr.op.clone()
             };
+            if trace {
+                eprintln!(
+                    "T ip={} op={:?} stk={}",
+                    self.ip - 1,
+                    dispatch_op,
+                    self.stack.len()
+                );
+            }
             match dispatch_op {
                 Opcode::PushConst => {
                     let s = self.pool_str(instr.operand)?;
@@ -743,8 +789,9 @@ impl Vm {
 
                     if self.pipeline_expected > 0 {
                         let args = self.pop_builtin_args(id, argc)?;
-                        let redirs =
+                        let mut redirs =
                             RedirSet::new(std::mem::take(&mut self.pipeline_pending_redirs));
+                        redirs.src = self.bc.src.clone();
                         self.pipeline_segments
                             .push(PipelineStage::Builtin { id, args, redirs });
                     } else {
@@ -774,6 +821,7 @@ impl Vm {
 
                 Opcode::CmdSubBegin => {
                     self.capture_stack.push(vec![]);
+                    self.cmdsub_envs.push(self.env.snapshot());
                 }
                 Opcode::CmdSubEnd => {
                     let buf = self.capture_stack.pop().unwrap_or_default();
@@ -782,6 +830,9 @@ impl Vm {
                         s.pop();
                     }
                     self.stack.push_str(s);
+                    if let Some(saved) = self.cmdsub_envs.pop() {
+                        self.env.restore(saved);
+                    }
                 }
 
                 Opcode::ProcSubBegin => {
@@ -829,8 +880,9 @@ impl Vm {
                         continue;
                     }
                     if self.pipeline_expected > 0 {
-                        let redirs =
+                        let mut redirs =
                             RedirSet::new(std::mem::take(&mut self.pipeline_pending_redirs));
+                        redirs.src = self.bc.src.clone();
                         self.pipeline_segments
                             .push(PipelineStage::External { argv, redirs });
                     } else if let Some(&entry_ip) = self.func_table.get(&argv[0]) {
@@ -923,8 +975,9 @@ impl Vm {
                                 // Wait for the prior child to signal done.
                                 let _ = prev_rdy.recv();
                             }
-                            let _ = child.run();
+                            let code = child.run().map(|s| s.code()).unwrap_or(1);
                             let _ = tx.send(());
+                            code
                         });
                         self.bg_handles.push(handle);
                     } else if let Err(e) = spawn_background(&argv, redirs) {
@@ -1071,10 +1124,15 @@ impl Vm {
                     self.adopt_redir(spec);
                 }
 
+                Opcode::DynRedirLine => {
+                    self.dyn_redir_line = instr.operand;
+                }
+
                 // Dynamic redirect — path is on top of the value stack.
                 Opcode::DynRedir => {
                     let kind_byte = (instr.operand >> 24) as u8;
                     let fd = instr.operand & 0x00FF_FFFF;
+                    let line = std::mem::take(&mut self.dyn_redir_line);
                     // bash: the redirect word is field-split, and 0 or >1
                     // fields is an "ambiguous redirect" — fail the statement.
                     if self.glob_surplus > 0 || self.glob_deficit > 0 {
@@ -1087,11 +1145,8 @@ impl Vm {
                         }
                         self.redir_failed = true;
                         self.update_status(ExitStatus::from_code(1));
-                        self.write_to_fd_inner(
-                            2,
-                            b"shellsc: ambiguous redirect\n",
-                            &mut Vec::new(),
-                        );
+                        let msg = redir_msg(&self.bc.src, line, "ambiguous redirect");
+                        self.write_to_fd_inner(2, msg.as_bytes(), &mut Vec::new());
                         continue;
                     }
                     let path = self.stack.pop()?.into_string();
@@ -1100,6 +1155,7 @@ impl Vm {
                             fd,
                             target: RedirTargetSpec::HereDoc(format!("{}\n", path)),
                             kind: RedirKind::In,
+                            line,
                         }
                     } else {
                         let kind = match kind_byte {
@@ -1114,6 +1170,7 @@ impl Vm {
                             fd,
                             target: RedirTargetSpec::File(path),
                             kind,
+                            line,
                         }
                     };
                     self.adopt_redir(spec);
@@ -1174,6 +1231,44 @@ impl Vm {
                     // Re-apply the subshell's status so $? reads correctly.
                     self.status = subshell_status;
                     self.env.set("?", subshell_status.to_string());
+                }
+                Opcode::SubshellBgEnd => {
+                    // `( ... ) &` — the body must run detached, not inline.
+                    // The parent has already executed the ops past SubshellBgEnd,
+                    // so re-run the body slice in a child VM fenced to the
+                    // subshell's own SubshellEnd, then hand the handle to `wait`.
+                    let body_start = instr.operand as usize;
+                    if let Some(saved) = self.subshell_envs.pop() {
+                        self.env.restore(saved);
+                    }
+                    let end = self
+                        .ip_fence
+                        .unwrap_or(self.instr_count())
+                        .min(self.instr_count());
+                    let mut child =
+                        Vm::new_child(self.bc.clone(), self.env.snapshot(), self.smc.clone());
+                    child.func_table = self.func_table.clone();
+                    child.pending_redirs = std::mem::take(&mut self.pending_redirs);
+                    child.ip = body_start;
+                    child.ip_fence = Some(end);
+                    child.call_stack.push(CallFrame {
+                        return_ip: usize::MAX,
+                        saved_redirs: vec![],
+                        base_redirs: vec![],
+                    });
+                    let prev = self.bg_chain.take();
+                    let (tx, rx) = std::sync::mpsc::channel::<()>();
+                    self.bg_chain = Some(rx);
+                    let handle = std::thread::spawn(move || {
+                        if let Some(prev_rdy) = prev {
+                            let _ = prev_rdy.recv();
+                        }
+                        let code = child.run().map(|s| s.code()).unwrap_or(1);
+                        let _ = tx.send(());
+                        code
+                    });
+                    self.bg_handles.push(handle);
+                    self.update_status(ExitStatus::OK);
                 }
                 Opcode::RedirSave => {
                     self.redir_stack.push(self.pending_redirs.clone());
@@ -1534,32 +1629,7 @@ impl Vm {
         if let builtins::trap::TrapDisposition::Command(cmd) = &self.trap_exit {
             let cmd = cmd.clone();
             self.trap_exit = builtins::trap::TrapDisposition::Default;
-            // If the trap command is a bare function name, invoke it directly
-            // in the current VM so func_table IPs resolve against the correct
-            // bytecode. Compiling "myfn" into a child VM would make its
-            // func_table entry_ips point into the parent's code, not the
-            // child's freshly compiled chunk.
-            if !cmd.contains(|c: char| c.is_whitespace() || c == ';' || c == '|' || c == '&')
-                && self.func_table.contains_key(cmd.as_str())
-            {
-                if let Some(&entry_ip) = self.func_table.get(cmd.as_str()) {
-                    let saved_ip = self.ip;
-                    let saved_fence = self.ip_fence;
-                    // Fence right after current position so FuncReturn breaks out.
-                    self.ip_fence = Some(saved_ip);
-                    self.env.push_frame(&[]);
-                    self.call_stack.push(CallFrame {
-                        return_ip: saved_ip,
-                        saved_redirs: self.pending_redirs.clone(),
-                        base_redirs: self.pending_redirs.clone(),
-                    });
-                    self.ip = entry_ip as usize;
-                    let _ = self.run();
-                    self.ip_fence = saved_fence;
-                    return;
-                }
-            }
-            self.run_trap_command(&cmd);
+            self.run_named_trap(&cmd);
         }
     }
 
@@ -1567,27 +1637,37 @@ impl Vm {
         if let builtins::trap::TrapDisposition::Command(cmd) = &self.trap_err {
             let cmd = cmd.clone();
             self.trap_err = builtins::trap::TrapDisposition::Default;
-            if !cmd.contains(|c: char| c.is_whitespace() || c == ';' || c == '|' || c == '&')
-                && self.func_table.contains_key(cmd.as_str())
-            {
-                if let Some(&entry_ip) = self.func_table.get(cmd.as_str()) {
-                    let saved_ip = self.ip;
-                    let saved_fence = self.ip_fence;
-                    self.ip_fence = Some(saved_ip);
-                    self.env.push_frame(&[]);
-                    self.call_stack.push(CallFrame {
-                        return_ip: saved_ip,
-                        saved_redirs: self.pending_redirs.clone(),
-                        base_redirs: self.pending_redirs.clone(),
-                    });
-                    self.ip = entry_ip as usize;
-                    let _ = self.run();
-                    self.ip_fence = saved_fence;
-                    return;
-                }
-            }
-            self.run_trap_command(&cmd);
+            self.run_named_trap(&cmd);
         }
+    }
+
+    fn run_named_trap(&mut self, cmd: &str) {
+        // If the trap command is a bare function name, invoke it directly
+        // in the current VM so func_table IPs resolve against the correct
+        // bytecode. Compiling "myfn" into a child VM would make its
+        // func_table entry_ips point into the parent's code, not the
+        // child's freshly compiled chunk.
+        if !cmd.contains(|c: char| c.is_whitespace() || c == ';' || c == '|' || c == '&')
+            && self.func_table.contains_key(cmd)
+        {
+            if let Some(&entry_ip) = self.func_table.get(cmd) {
+                let saved_ip = self.ip;
+                let saved_fence = self.ip_fence;
+                // Fence right after current position so FuncReturn breaks out.
+                self.ip_fence = Some(saved_ip);
+                self.env.push_frame(&[]);
+                self.call_stack.push(CallFrame {
+                    return_ip: saved_ip,
+                    saved_redirs: self.pending_redirs.clone(),
+                    base_redirs: self.pending_redirs.clone(),
+                });
+                self.ip = entry_ip as usize;
+                let _ = self.run();
+                self.ip_fence = saved_fence;
+                return;
+            }
+        }
+        self.run_trap_command(cmd);
     }
 
     fn run_trap_command(&mut self, cmd: &str) {
@@ -1701,9 +1781,17 @@ impl Vm {
                             let name = argv.first().cloned().unwrap_or_default();
                             let saved = std::mem::take(&mut self.pending_redirs);
                             self.pending_redirs = redirs.specs.clone();
-                            self.print_exec_error(&name, e);
+                            match e {
+                                ShellError::RedirError(msg) => {
+                                    self.write_to_fd_inner(2, msg.as_bytes(), &mut Vec::new());
+                                    last_status = ExitStatus::from_code(1);
+                                }
+                                e => {
+                                    self.print_exec_error(&name, e);
+                                    last_status = ExitStatus::from_code(127);
+                                }
+                            }
                             self.pending_redirs = saved;
-                            last_status = ExitStatus::from_code(127);
                             stdin_buf = if !is_last { Some(vec![]) } else { None };
                         }
                     }
@@ -1735,8 +1823,15 @@ impl Vm {
                     let pipe_in = stdin_buf
                         .as_deref()
                         .filter(|_| !redirs.specs.iter().any(|s| s.fd == 0));
+                    // A real pipeline (n > 1) runs every stage in a subshell:
+                    // builtin assignments (`read x`, `cd`) must not survive
+                    // into the caller's env.
+                    let saved_env = (n > 1).then(|| self.env.snapshot());
                     let result =
                         run_builtin_stage_for_vm(id, &args, &mut self.env, pipe_in, &redirs)?;
+                    if let Some(saved) = saved_env {
+                        self.env.restore(saved);
+                    }
                     last_status = result.0;
                     stdin_buf = if !is_last || capture_out {
                         Some(result.1)
@@ -1785,6 +1880,13 @@ impl Vm {
     // ── Error handling ────────────────────────────────────────────────────────
 
     fn handle_exec_error(&mut self, cmd: &str, e: ShellError) {
+        // Redirection failures carry a pre-formatted bash-style message;
+        // print it verbatim with status 1 (never the 127 path).
+        if let ShellError::RedirError(msg) = e {
+            self.write_to_fd_inner(2, msg.as_bytes(), &mut Vec::new());
+            self.update_status(ExitStatus::from_code(1));
+            return;
+        }
         // A redirection failure (bad fd) was already reported by the redir
         // layer; bash exits 1 and does not print a second diagnostic.
         if e.to_string().contains("Bad file descriptor") {
@@ -1834,7 +1936,11 @@ impl Vm {
                 // message to stderr, command does not run).
                 self.redir_failed = true;
                 self.update_status(ExitStatus::from_code(1));
-                let msg = format!("shellsc: {}: {}\n", path, e);
+                let msg = redir_msg(
+                    &self.bc.src,
+                    spec.line,
+                    &format!("{}: {}", path, io_short(&e)),
+                );
                 self.write_to_fd_inner(2, msg.as_bytes(), &mut Vec::new());
                 return;
             }
@@ -2206,7 +2312,12 @@ impl Vm {
                             Err(e) => {
                                 // bash reports the open failure and keeps
                                 // going; the fd stays unusable.
-                                let _ = writeln!(std::io::stderr(), "exec: {}: {}", path, e);
+                                let msg = redir_msg(
+                                    &self.bc.src,
+                                    spec.line,
+                                    &format!("{}: {}", path, io_short(&e)),
+                                );
+                                let _ = writeln!(std::io::stderr(), "{}", msg.trim_end());
                                 status = ExitStatus::from_code(1);
                             }
                         }
@@ -2260,7 +2371,15 @@ impl Vm {
                                     .create(true)
                                     .truncate(matches!(spec.kind, RedirKind::Out))
                                     .open(path);
-                                if opened.is_err() {
+                                if let Err(e) = opened {
+                                    // bash reports the open failure (script
+                                    // keeps going); the fd stays unredirected.
+                                    let msg = redir_msg(
+                                        &self.bc.src,
+                                        spec.line,
+                                        &format!("{}: {}", path, io_short(&e)),
+                                    );
+                                    let _ = writeln!(std::io::stderr(), "{}", msg.trim_end());
                                     status = ExitStatus::from_code(1);
                                     continue;
                                 }
@@ -2367,9 +2486,8 @@ impl Vm {
             // wait [pid…] — wait for all background jobs (or specific PIDs).
             BuiltinId::Wait => {
                 let _ = self.pop_n(argc)?;
-                // Join all background function-call children (external bg
-                // processes are reaped by the OS; the shell-level `&`
-                // function VMs are the ones we own).
+                // Join all background children (external bg processes are
+                // reaped by the OS; the `&` function / subshell VMs are ours).
                 self.bg_chain = None;
                 for h in self.bg_handles.drain(..) {
                     let _ = h.join();
@@ -2438,11 +2556,18 @@ impl Vm {
     }
 
     /// Pool fetch valid in both modes: plaintext clone or SMC decrypt.
+    /// Pool-sealed streams (bytecode 0x04) hand back hex ciphertext from
+    /// either store — open it here so plaintext exists only for the caller's
+    /// immediate use, not for the whole run.
     fn pool_str(&self, idx: u32) -> Result<String, ShellError> {
-        if self.smc.is_some() {
-            self.pool_smc(idx)
+        let raw = if self.smc.is_some() {
+            self.pool_smc(idx)?
         } else {
-            Ok(self.pool(idx)?.to_string())
+            self.pool(idx)?.to_string()
+        };
+        match &self.bc.const_pool.key {
+            None => Ok(raw),
+            Some(k) => shell_bc::pool_seal::open_str(k, idx, &raw),
         }
     }
 
@@ -2548,15 +2673,16 @@ impl Vm {
         }
         RedirSet {
             specs,
+            src: self.bc.src.clone(),
             exec_files,
             exec_dups: self.exec_fd_dups.clone(),
         }
     }
 
     fn redir_spec(&self, idx: u32) -> Result<RedirSpec, ShellError> {
-        // Build (kind, fd, target) either from the plaintext table or by
-        // decrypting the SMC entry on demand.
-        let (kind, fd, target) = match &self.smc {
+        // Build (kind, fd, target, line) either from the plaintext table or
+        // by decrypting the SMC entry on demand.
+        let (kind, fd, target, line) = match &self.smc {
             Some(s) => {
                 let e = s.redirs().get(idx as usize).ok_or_else(|| {
                     ShellError::BytecodeError(format!("redir index {} out of bounds", idx))
@@ -2577,7 +2703,7 @@ impl Vm {
                         RedirTargetSpec::HereDoc(expanded)
                     }
                 };
-                (kind, e.fd, target)
+                (kind, e.fd, target, e.line)
             }
             None => {
                 let e = self.bc.redirs.get(idx as usize).ok_or_else(|| {
@@ -2597,10 +2723,15 @@ impl Vm {
                         RedirTargetSpec::HereDoc(expanded)
                     }
                 };
-                (e.kind.clone(), e.fd, target)
+                (e.kind.clone(), e.fd, target, e.line)
             }
         };
-        Ok(RedirSpec { kind, fd, target })
+        Ok(RedirSpec {
+            kind,
+            fd,
+            target,
+            line,
+        })
     }
 
     /// Field-split on the current $IFS. Default IFS = space/tab/newline

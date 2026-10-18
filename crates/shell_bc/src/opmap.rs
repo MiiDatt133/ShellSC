@@ -26,13 +26,19 @@ pub fn instruction_offsets(data: &[u8]) -> Result<Vec<usize>, ShellError> {
         return Err(ShellError::BytecodeError("bad magic".into()));
     }
     let version = r.read_u8()?;
-    if version != 0x01 && version != 0x02 && version != 0x03 {
+    if version != 0x01 && version != 0x02 && version != 0x03 && version != 0x04 {
         return Err(ShellError::BytecodeError(format!(
             "unsupported bytecode version: {}",
             version
         )));
     }
     r.read_bytes(3)?;
+
+    // 0x04: pool-sealed streams carry the pool key right after the
+    // reserved bytes (see pool_seal::seal_stream).
+    if version == 0x04 {
+        r.read_bytes(16)?;
+    }
 
     let pool_count = r.read_u32()? as usize;
     for _ in 0..pool_count {

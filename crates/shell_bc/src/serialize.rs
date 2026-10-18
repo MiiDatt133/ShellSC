@@ -53,6 +53,23 @@ pub fn serialize(bc: &Bytecode) -> Vec<u8> {
         push_u32(&mut out, instr.operand);
     }
 
+    // SLNE trailer: source-line metadata that older readers must ignore
+    // (they stop after the instruction table; pool-seal copies it verbatim).
+    out.extend_from_slice(b"SLNE");
+    push_u32(&mut out, bc.redirs.len() as u32);
+    for r in &bc.redirs {
+        push_u32(&mut out, r.line);
+    }
+    push_u32(&mut out, bc.heredoc_warns.len() as u32);
+    for w in &bc.heredoc_warns {
+        push_u32(&mut out, w.line);
+        push_u32(&mut out, w.eof_line);
+        push_u32(&mut out, w.delim.len() as u32);
+        out.extend_from_slice(w.delim.as_bytes());
+    }
+    push_u32(&mut out, bc.src.len() as u32);
+    out.extend_from_slice(bc.src.as_bytes());
+
     out
 }
 

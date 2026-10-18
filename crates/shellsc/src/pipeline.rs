@@ -25,12 +25,20 @@ pub fn sbc_to_bytecode(sbc: &str) -> Result<Bytecode> {
 
 pub fn full_pipeline(
     src: &str,
+    src_path: &str,
     protect: bool,
     smc: bool,
     selfdebug: bool,
 ) -> Result<(String, Vec<u8>, Vec<u8>)> {
-    let sbc = sh_to_sbc(src)?;
+    // Lex directly (not sh_to_sbc) so unterminated-heredoc warnings survive
+    // to the bytecode; src_path is echoed in bash-style diagnostics.
+    let (tokens, heredoc_warns) = Lexer::new(src).tokenize_verbose().map_err(map_shell_err)?;
+    let script = Parser::new(tokens).parse().map_err(map_shell_err)?;
+    let chunk = Lowerer::new().lower(&script).map_err(map_shell_err)?;
+    let sbc = compile_to_sbc(&opt::optimize(chunk));
     let mut bc = sbc_to_bytecode(&sbc)?;
+    bc.src = src_path.to_string();
+    bc.heredoc_warns = heredoc_warns;
     if protect {
         // O-LLVM-style bytecode passes. Runs before seal() so the
         // integrity CRC is computed over the obfuscated stream.

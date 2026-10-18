@@ -63,7 +63,10 @@ impl Env {
     pub fn get(&self, name: &str) -> Option<&str> {
         // Positional params are bound per function frame — never fall through
         // to an outer frame's params (bash: `fn` with no args sees empty `$1`).
-        let is_positional = !name.is_empty() && name.chars().all(|c| c.is_ascii_digit());
+        // `$0` is NOT positional (bash: it stays the script name inside
+        // functions), so it must look through function frames.
+        let is_positional =
+            name != "0" && !name.is_empty() && name.chars().all(|c| c.is_ascii_digit());
         for frame in self.frames.iter().rev() {
             if let Some(v) = frame.get(name) {
                 return Some(v.as_str());
@@ -104,7 +107,12 @@ impl Env {
             self.array_set_index(&name, 0, value);
             return;
         }
-        safe_set_var(&name, &value);
+        // Only exported names live in the process environment — spawn()
+        // inherits it verbatim, so writing non-exported vars here would leak
+        // them into every child (`myvar=x; env` must not show myvar).
+        if self.exported.contains(&name) {
+            safe_set_var(&name, &value);
+        }
         for frame in self.frames.iter_mut().rev() {
             if frame.contains_key(&name) {
                 frame.insert(name, value);
@@ -438,6 +446,18 @@ mod tests {
     }
 
     #[test]
+    fn restore_undoes_subshell_assignment() {
+        let mut e = env();
+        e.set("a", "OUTER");
+        let saved = e.snapshot();
+        e.set("a", "INNER");
+        e.set("fresh", "NEW");
+        e.restore(saved);
+        assert_eq!(e.get("a"), Some("OUTER"));
+        assert_eq!(e.get("fresh"), None);
+    }
+
+    #[test]
     fn index_set_grows_sparse() {
         let mut e = env();
         e.array_set_index("a", 3, "v".into());
@@ -484,5 +504,37 @@ mod tests {
         assert_eq!(e.array_get_all("a"), vec!["1", "2", "3"]);
         e.array_unset_index("a", 0);
         assert_eq!(e.array_get_all("a"), vec!["2", "3"]);
+    }
+
+    #[test]
+    fn arg0_survives_function_frame() {
+        // $0 is not positional: it must stay the script name inside functions,
+        // never the "shellsc" fallback from a frame-blocked lookup.
+        let mut e = env();
+        e.set("0", "./script.sh");
+        e.push_frame(&["a".into()]);
+        assert_eq!(e.get("0"), Some("./script.sh"));
+        // positional params remain frame-local
+        assert_eq!(e.get("1"), Some("a"));
+        assert_eq!(e.get("2"), None);
+        e.pop_frame();
+        assert_eq!(e.get("0"), Some("./script.sh"));
+    }
+
+    #[test]
+    fn set_skips_process_env_for_unexported() {
+        // spawn() inherits the process env verbatim — assigning a plain
+        // shell variable must not make it visible to child processes.
+        let mut e = env();
+        let plain = "shellsc_test_plain_leak";
+        let exported = "shellsc_test_exported_sync";
+        e.set(plain, "v1");
+        assert_eq!(std::env::var(plain), Err(std::env::VarError::NotPresent));
+        e.export(exported, Some("v1"));
+        assert_eq!(std::env::var(exported).as_deref(), Ok("v1"));
+        e.set(exported, "v2");
+        assert_eq!(std::env::var(exported).as_deref(), Ok("v2"));
+        std::env::remove_var(plain);
+        std::env::remove_var(exported);
     }
 }

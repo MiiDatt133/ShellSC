@@ -3,6 +3,7 @@ w() { echo "w1:$1"; echo "w2:$2"; }
 w X Y &
 wait
 w Z >> bgappend.txt &
+wait
 w W >> bgappend.txt &
 wait
 echo "app:$(cat bgappend.txt)"

@@ -29,6 +29,11 @@ pub enum ShellError {
 
     #[error("io error: {0}")]
     IoError(String),
+
+    /// Redirection failure carrying a pre-formatted bash-style diagnostic
+    /// (`{src}: line {n}: {detail}`). Printed verbatim; statement status 1.
+    #[error("{0}")]
+    RedirError(String),
 }
 
 impl ShellError {

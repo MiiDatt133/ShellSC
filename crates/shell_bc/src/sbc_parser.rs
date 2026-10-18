@@ -158,7 +158,8 @@ impl<'a> SbcParser<'a> {
     }
 }
 
-/// Parse Redirect args: [Str(kind), Uint(fd), Str("File"|"Fd"|"HereDoc"), Str(path)|Uint(n)]
+/// Parse Redirect args: [Str(kind), Uint(fd), Str("File"|"Fd"|"HereDoc"), Str(path)|Uint(n),
+/// Uint(line)?]
 pub fn parse_redir_args(args: &[SbcArg], lineno: usize) -> Result<RedirEntry, ShellError> {
     if args.len() < 4 {
         return Err(ShellError::BytecodeError(format!(
@@ -229,5 +230,15 @@ pub fn parse_redir_args(args: &[SbcArg], lineno: usize) -> Result<RedirEntry, Sh
             )))
         }
     };
-    Ok(RedirEntry { kind, fd, target })
+    // Optional trailing source line (missing in hand-written SBC → 0).
+    let line = match args.get(4) {
+        Some(SbcArg::Uint(n)) => *n,
+        _ => 0,
+    };
+    Ok(RedirEntry {
+        kind,
+        fd,
+        target,
+        line,
+    })
 }

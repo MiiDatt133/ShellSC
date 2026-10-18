@@ -4,8 +4,10 @@
 //! not transfer to build B.
 //!
 //! The variant build uses a private target dir so it never poisons the
-//! workspace's normal build cache. Each seed gets its own dir, which also
-//! gives incremental-rebuild speed when the same seed is reused.
+//! workspace's normal build cache. One shared dir (not per-seed): the seed
+//! rides on SHELLSC_VARIANT_SEED with `rerun-if-env-changed`, so switching
+//! seeds rebuilds in place — per-seed dirs leaked a fresh ~32M directory
+//! on every protected build.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,7 +19,7 @@ use crate::protect::Rng;
 /// Build a per-seed stub variant and return the binary path.
 /// `ws_root` is the workspace root (directory containing Cargo.toml).
 pub fn build_variant_stub(ws_root: &Path, seed: u32) -> Result<PathBuf, ShellError> {
-    let target_dir = ws_root.join(format!("target/shellsc-variant-{seed}"));
+    let target_dir = ws_root.join("target/shellsc-variant");
     std::fs::create_dir_all(&target_dir)
         .map_err(|e| ShellError::IoError(format!("variant target dir: {}", e)))?;
 

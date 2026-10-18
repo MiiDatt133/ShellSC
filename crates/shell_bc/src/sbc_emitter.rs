@@ -8,16 +8,26 @@ impl SbcEmitter {
     }
 
     pub fn emit(&self, chunk: &IrChunk) -> String {
-        let mut out = String::new();
-
+        // RedirectDyn expands to two instructions (DynRedirLine + DynRedir),
+        // so IR-op indices embedded in jump/entry operands must be remapped
+        // to SBC instruction indices.
+        let mut map: Vec<u32> = Vec::with_capacity(chunk.ops.len() + 1);
+        let mut idx: u32 = 0;
         for op in &chunk.ops {
-            self.emit_op(op, &mut out);
+            map.push(idx);
+            idx += 1 + u32::from(matches!(op, IrOp::RedirectDyn { .. }));
+        }
+        map.push(idx);
+
+        let mut out = String::new();
+        for op in &chunk.ops {
+            self.emit_op(op, &map, &mut out);
         }
 
         out
     }
 
-    fn emit_op(&self, op: &IrOp, out: &mut String) {
+    fn emit_op(&self, op: &IrOp, map: &[u32], out: &mut String) {
         match op {
             IrOp::PushConst(s) => {
                 out.push_str(&format!("PushConst {}\n", q(s)));
@@ -68,7 +78,7 @@ impl SbcEmitter {
             }
 
             IrOp::FuncDef { name, entry } => {
-                out.push_str(&format!("FuncDef {} {}\n", q(name), entry));
+                out.push_str(&format!("FuncDef {} {}\n", q(name), map[*entry]));
             }
 
             IrOp::FuncReturn => {
@@ -116,7 +126,7 @@ impl SbcEmitter {
             }
 
             IrOp::PipeSubshellBegin(lbl) => {
-                out.push_str(&format!("PipeSubshellBegin {}\n", lbl));
+                out.push_str(&format!("PipeSubshellBegin {}\n", map[*lbl]));
             }
 
             IrOp::PipeSubshellEnd => {
@@ -141,10 +151,13 @@ impl SbcEmitter {
                     IrRedirTarget::HereDoc(b) => format!("HereDoc {}", q(b)),
                 };
 
-                out.push_str(&format!("Redirect {} {} {}\n", kind, r.fd, target));
+                out.push_str(&format!(
+                    "Redirect {} {} {} {}\n",
+                    kind, r.fd, target, r.line
+                ));
             }
 
-            IrOp::RedirectDyn { kind, fd } => {
+            IrOp::RedirectDyn { kind, fd, line } => {
                 let k: u8 = match kind {
                     IrRedirKind::Out => 0,
                     IrRedirKind::Append => 1,
@@ -156,19 +169,22 @@ impl SbcEmitter {
                     IrRedirKind::HereDocLit => 5, // unreachable: heredocs are never dynamic
                 };
 
+                // The line rides in its own instruction right before DynRedir
+                // so the packed operand keeps kind+fd untouched.
+                out.push_str(&format!("DynRedirLine {}\n", line));
                 out.push_str(&format!("DynRedir {} {}\n", k, fd));
             }
 
             IrOp::Jmp(t) => {
-                out.push_str(&format!("Jmp {}\n", t));
+                out.push_str(&format!("Jmp {}\n", map[*t]));
             }
 
             IrOp::JmpIfFail(t) => {
-                out.push_str(&format!("JmpIfFail {}\n", t));
+                out.push_str(&format!("JmpIfFail {}\n", map[*t]));
             }
 
             IrOp::JmpIfOk(t) => {
-                out.push_str(&format!("JmpIfOk {}\n", t));
+                out.push_str(&format!("JmpIfOk {}\n", map[*t]));
             }
 
             IrOp::StatusOk => {
@@ -216,6 +232,9 @@ impl SbcEmitter {
             }
             IrOp::SubshellEnd => {
                 out.push_str("SubshellEnd\n");
+            }
+            IrOp::SubshellBgEnd(body) => {
+                out.push_str(&format!("SubshellBgEnd {}\n", map[*body]));
             }
 
             IrOp::GlobExpand => {
@@ -294,4 +313,48 @@ fn q(s: &str) -> String {
 
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shell_ir::IrRedirKind;
+
+    // RedirectDyn expands to two SBC instructions, so jump/entry operands
+    // must be remapped — a raw IR index lands mid-instruction (off-by-one).
+    #[test]
+    fn jump_targets_remap_around_redirect_dyn() {
+        let mut chunk = IrChunk::new();
+        chunk.push(IrOp::RedirectDyn {
+            kind: IrRedirKind::HereString,
+            fd: 0,
+            line: 1,
+        });
+        chunk.push(IrOp::Jmp(2));
+        chunk.push(IrOp::Exit);
+        // IR index 2 (the Jmp) sits at SBC index 3 once RedirectDyn doubles.
+        let out = SbcEmitter::new().emit(&chunk);
+        assert!(out.contains("Jmp 3\n"), "unmapped target:\n{out}");
+    }
+
+    #[test]
+    fn funcdef_entry_remaps_around_redirect_dyn() {
+        let mut chunk = IrChunk::new();
+        chunk.push(IrOp::RedirectDyn {
+            kind: IrRedirKind::Out,
+            fd: 1,
+            line: 1,
+        });
+        chunk.push(IrOp::FuncDef {
+            name: "f".into(),
+            entry: 3,
+        });
+        chunk.push(IrOp::PushVar("x".into()));
+        chunk.push(IrOp::Exit);
+        // IR index 3 (PushVar) sits at SBC index 4.
+        let out = SbcEmitter::new().emit(&chunk);
+        assert!(out.contains("FuncDef \"f\" 4\n"), "unmapped entry:\n{out}");
+        // Redirect itself still expands to the pair.
+        assert!(out.contains("DynRedirLine 1\n"), "missing line op:\n{out}");
+    }
 }

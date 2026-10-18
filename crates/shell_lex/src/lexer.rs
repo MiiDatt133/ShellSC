@@ -4,19 +4,23 @@ use crate::{
     cursor::Cursor,
     token::{Token, TokenKind},
 };
-use shell_ast::{ShellError, Span};
+use shell_ast::{HeredocWarning, ShellError, Span};
 
 #[derive(Debug, Clone)]
 struct PendingHereDoc {
     delimiter: String,
     strip_tabs: bool,
+    /// Line of the `<<` operator (bash: "here-document at line N").
+    line: u32,
 }
 
 pub struct Lexer<'a> {
     cursor: Cursor<'a>,
     queued: VecDeque<Token>,
-    awaiting_heredoc: Option<bool>,
+    /// (strip_tabs, line of the `<<` operator)
+    awaiting_heredoc: Option<(bool, u32)>,
     pending_heredocs: Vec<PendingHereDoc>,
+    heredoc_warns: Vec<HeredocWarning>,
 }
 
 impl<'a> Lexer<'a> {
@@ -26,10 +30,18 @@ impl<'a> Lexer<'a> {
             queued: VecDeque::new(),
             awaiting_heredoc: None,
             pending_heredocs: vec![],
+            heredoc_warns: vec![],
         }
     }
 
-    pub fn tokenize(mut self) -> Result<Vec<Token>, ShellError> {
+    pub fn tokenize(self) -> Result<Vec<Token>, ShellError> {
+        Ok(self.tokenize_verbose()?.0)
+    }
+
+    /// Tokenise and also return unterminated-heredoc warnings (bash prints
+    /// them before the script runs; `tokenize` callers such as `eval` drop
+    /// them).
+    pub fn tokenize_verbose(mut self) -> Result<(Vec<Token>, Vec<HeredocWarning>), ShellError> {
         let mut tokens = vec![];
         loop {
             let tok = self.next_token()?;
@@ -39,7 +51,28 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        Ok(tokens)
+        let warns = std::mem::take(&mut self.heredoc_warns);
+        Ok((tokens, warns))
+    }
+
+    /// Line number of the EOF position: bash reports the line the file's
+    /// last byte sits on — a trailing newline does not advance it.
+    fn eof_line(&self) -> u32 {
+        if self.cursor.line <= 1 {
+            1
+        } else if self.cursor.col == 1 {
+            self.cursor.line - 1
+        } else {
+            self.cursor.line
+        }
+    }
+
+    fn record_eof_heredoc_warning(&mut self, heredoc: &PendingHereDoc) {
+        self.heredoc_warns.push(HeredocWarning {
+            line: heredoc.line,
+            eof_line: self.eof_line(),
+            delim: heredoc.delimiter.clone(),
+        });
     }
 
     fn next_token(&mut self) -> Result<Token, ShellError> {
@@ -181,7 +214,7 @@ impl<'a> Lexer<'a> {
                         Ok(self.make(TokenKind::HereString, start, start_ln, start_col))
                     } else {
                         let strip_tabs = self.cursor.eat('-');
-                        self.awaiting_heredoc = Some(strip_tabs);
+                        self.awaiting_heredoc = Some((strip_tabs, start_ln));
                         if strip_tabs {
                             Ok(self.make(TokenKind::HereDocStrip, start, start_ln, start_col))
                         } else {
@@ -557,7 +590,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn record_heredoc_delimiter(&mut self, kind: &TokenKind) -> Result<(), ShellError> {
-        let Some(strip_tabs) = self.awaiting_heredoc.take() else {
+        let Some((strip_tabs, line)) = self.awaiting_heredoc.take() else {
             return Ok(());
         };
 
@@ -581,6 +614,7 @@ impl<'a> Lexer<'a> {
         self.pending_heredocs.push(PendingHereDoc {
             delimiter,
             strip_tabs,
+            line,
         });
         Ok(())
     }
@@ -616,6 +650,7 @@ impl<'a> Lexer<'a> {
             if self.cursor.peek().is_none() {
                 // bash: EOF before the terminator is a warning, not an error —
                 // the body runs to end of file and lexing continues.
+                self.record_eof_heredoc_warning(heredoc);
                 break;
             }
 
@@ -654,7 +689,11 @@ impl<'a> Lexer<'a> {
                     self.cursor.advance();
                     body.push('\n');
                 }
-                None => break, // EOF: keep the accumulated body (bash warning case)
+                None => {
+                    // EOF without a trailing newline: keep the body, warn.
+                    self.record_eof_heredoc_warning(heredoc);
+                    break;
+                }
                 _ => unreachable!(),
             }
         }

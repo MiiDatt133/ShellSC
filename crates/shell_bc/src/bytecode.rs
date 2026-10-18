@@ -72,6 +72,9 @@ pub struct RedirEntry {
     pub kind: RedirKind,
     pub fd: u32,
     pub target: RedirTarget,
+    /// Source line of the redirect operator (0 when unknown, e.g. SBC text
+    /// built by hand). Carried into the SLNE trailer.
+    pub line: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +89,12 @@ pub struct Bytecode {
     pub const_pool: ConstPool,
     pub redirs: Vec<RedirEntry>,
     pub funcs: Vec<FuncEntry>,
+    /// Compile-source path, echoed in bash-style diagnostics
+    /// (`{src}: line {n}: …`). Empty for eval-generated chunks.
+    pub src: String,
+    /// Unterminated-heredoc warnings collected at lex time; the VM prints
+    /// them before executing (bash parses the whole file up front).
+    pub heredoc_warns: Vec<shell_ast::HeredocWarning>,
 }
 
 impl Bytecode {
@@ -95,6 +104,8 @@ impl Bytecode {
             const_pool: ConstPool::new(),
             redirs: vec![],
             funcs: vec![],
+            src: String::new(),
+            heredoc_warns: vec![],
         }
     }
 

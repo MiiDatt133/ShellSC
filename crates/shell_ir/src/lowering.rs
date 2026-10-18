@@ -577,11 +577,13 @@ impl Lowerer {
                         kind: IrRedirKind::OutFd,
                         fd: 2,
                         target: IrRedirTarget::Fd(1),
+                        line: redir.span.line,
                     });
                     return Ok(Some(IrRedir {
                         kind: base_kind,
                         fd: 1,
                         target: IrRedirTarget::File(file),
+                        line: redir.span.line,
                     }));
                 }
                 // Dynamic target: evaluate word, RedirectDyn for fd1, then
@@ -591,11 +593,13 @@ impl Lowerer {
                 self.chunk.push(IrOp::RedirectDyn {
                     kind: base_kind,
                     fd: 1,
+                    line: redir.span.line,
                 });
                 self.extra_redirs.push(IrRedir {
                     kind: IrRedirKind::OutFd,
                     fd: 2,
                     target: IrRedirTarget::Fd(1),
+                    line: redir.span.line,
                 });
                 return Ok(None);
             }
@@ -631,7 +635,11 @@ impl Lowerer {
                     // <<< target is a single string: collapse multi-slot
                     // expansions (`"${a[@]}"`) to one space-joined slot.
                     self.lower_word_joined(w)?;
-                    self.chunk.push(IrOp::RedirectDyn { kind, fd });
+                    self.chunk.push(IrOp::RedirectDyn {
+                        kind,
+                        fd,
+                        line: redir.span.line,
+                    });
                     return Ok(None);
                 }
                 if let Some(lit) = w.as_literal() {
@@ -639,7 +647,11 @@ impl Lowerer {
                 } else {
                     // Dynamic target: evaluate the word onto the stack, then emit RedirectDyn.
                     self.lower_word(w)?;
-                    self.chunk.push(IrOp::RedirectDyn { kind, fd });
+                    self.chunk.push(IrOp::RedirectDyn {
+                        kind,
+                        fd,
+                        line: redir.span.line,
+                    });
                     return Ok(None);
                 }
             }
@@ -653,7 +665,12 @@ impl Lowerer {
                 IrRedirTarget::HereDoc(body)
             }
         };
-        Ok(Some(IrRedir { kind, fd, target }))
+        Ok(Some(IrRedir {
+            kind,
+            fd,
+            target,
+            line: redir.span.line,
+        }))
     }
 
     fn strip_heredoc_tabs(body: &str) -> String {
@@ -686,6 +703,12 @@ impl Lowerer {
     }
 
     fn lower_background(&mut self, inner: &Stmt) -> Result<(), ShellError> {
+        // A subshell needs the marker at lowering time: by the time we are
+        // called the body has already been emitted, so the VM would have run
+        // it inline and `&` would be a no-op.
+        if let Stmt::Subshell { stmts, redirects } = inner {
+            return self.lower_subshell_bg(stmts, redirects, true);
+        }
         let before = self.chunk.here();
         self.lower_stmt(inner)?;
         let after = self.chunk.here();
@@ -843,6 +866,15 @@ impl Lowerer {
     }
 
     fn lower_subshell(&mut self, stmts: &[Stmt], redirects: &[Redirect]) -> Result<(), ShellError> {
+        self.lower_subshell_bg(stmts, redirects, false)
+    }
+
+    fn lower_subshell_bg(
+        &mut self,
+        stmts: &[Stmt],
+        redirects: &[Redirect],
+        background: bool,
+    ) -> Result<(), ShellError> {
         for redir in redirects {
             if let Some(ir) = self.lower_redirect(redir)? {
                 self.chunk.push(IrOp::Redirect(ir));
@@ -852,10 +884,23 @@ impl Lowerer {
             }
         }
         self.chunk.push(IrOp::SubshellBegin);
-        for s in stmts {
-            self.lower_stmt(s)?;
+        if background {
+            // The parent must not execute the body inline: jump straight to
+            // the marker, which spawns it as a detached child instead.
+            let skip = self.chunk.push_placeholder(IrOp::Jmp(0));
+            let body_start = self.chunk.here();
+            for s in stmts {
+                self.lower_stmt(s)?;
+            }
+            self.chunk.push(IrOp::SubshellBgEnd(body_start));
+            let after = self.chunk.here();
+            self.chunk.patch(skip, after);
+        } else {
+            for s in stmts {
+                self.lower_stmt(s)?;
+            }
+            self.chunk.push(IrOp::SubshellEnd);
         }
-        self.chunk.push(IrOp::SubshellEnd);
         Ok(())
     }
 

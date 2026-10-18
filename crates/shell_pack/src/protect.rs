@@ -17,7 +17,10 @@ pub const PROTECT_MAGIC: &[u8; 12] = b"SHELLSC_PROT";
 /// Version byte: bumped on any header-layout change.
 /// v4: cff_seed and opmap_seed are stored XOR-masked with the stub .text
 /// CRC (like the key since v3) — no seed bytes readable without the stub.
-pub const PROTECT_VERSION: u8 = 4;
+/// v5: body encrypted with the content-chained keystream (chain_crypt)
+/// instead of the repeating 16-byte XOR; const pool sealed to bytecode
+/// 0x04 (pool_seal) when FLAG_ENCRYPTED. v4 payloads still open.
+pub const PROTECT_VERSION: u8 = 5;
 
 /// magic 12 + version 1 + flags 1 + cff_seed 2 + key 16 + crc32 4 +
 /// orig_len 4 + opmap_seed 4 + opaque_param1 4 + opaque_param2 4 = 52 bytes.
@@ -75,7 +78,8 @@ impl ProtectHeader {
         if &bytes[0..12] != PROTECT_MAGIC {
             return Err(ShellError::IoError("bad protect magic".into()));
         }
-        if bytes[12] != PROTECT_VERSION {
+        // v4 payloads stay readable; seal() only produces the current version.
+        if bytes[12] != PROTECT_VERSION && bytes[12] != 4 {
             return Err(ShellError::IoError(format!(
                 "unsupported protect version {}",
                 bytes[12]
@@ -373,6 +377,22 @@ pub fn seal(bc_bytes: &[u8], opts: ProtectOptions, text_hash: u32) -> Result<Vec
 
     let mut body = bc_bytes.to_vec();
 
+    // v5: seal the const pool first (0x03 -> 0x04 with per-entry ciphertext)
+    // so the CRC/length checks in open() cover the sealed layout that comes
+    // back out of the decrypt path. The pool key travels inside the chain-
+    // encrypted body, never in the header.
+    if opts.encrypt {
+        let pool_key = rng.key16();
+        body = shell_bc::pool_seal::seal_stream(&body, &pool_key)?;
+    }
+
+    // Checksum over the sealed bare stream: open() verifies it after the
+    // decrypt + CFI strip + opmap revert, so compute it BEFORE the shuffle
+    // (revert is an exact inverse) — this is the byte sequence open() has
+    // in hand at that point.
+    let crc = crc32(&body);
+    let orig_len = body.len() as u32;
+
     if opts.opmap {
         let perm = opcode_permutation(seed);
         apply_opmap(&mut body, &perm)?;
@@ -393,9 +413,8 @@ pub fn seal(bc_bytes: &[u8], opts: ProtectOptions, text_hash: u32) -> Result<Vec
         body = framed;
     }
 
-    let crc = crc32(bc_bytes);
     if opts.encrypt {
-        xor_crypt(&key, &mut body);
+        shell_bc::pool_seal::chain_crypt(&key, &mut body, false);
     }
 
     let cff_seed = if opts.cff { rng.next_u64() as u16 } else { 0 };
@@ -430,7 +449,7 @@ pub fn seal(bc_bytes: &[u8], opts: ProtectOptions, text_hash: u32) -> Result<Vec
         cff_seed: stored_cff_seed,
         key: stored_key,
         crc32: crc,
-        orig_len: bc_bytes.len() as u32,
+        orig_len,
         opmap_seed: stored_opmap_seed,
         opaque_param1: opaque_p1,
         opaque_param2: opaque_p2,
@@ -487,7 +506,11 @@ pub fn open(
         } else {
             header.key
         };
-        xor_crypt(&real_key, &mut body);
+        if version >= PROTECT_VERSION {
+            shell_bc::pool_seal::chain_crypt(&real_key, &mut body, true);
+        } else {
+            xor_crypt(&real_key, &mut body);
+        }
     }
 
     // CFI table frames the SHBC stream: [num_blocks u32 LE][crc32 * n].
@@ -519,7 +542,7 @@ pub fn open(
     let seeds = derive_seeds(&header, version, text_hash);
 
     if header.flags & FLAG_OPMAP != 0 && seeds.opmap_seed != 0 {
-        let inv = opcode_inverse(seeds.opmap_seed);
+        let inv = opcode_inverse(seeds.opmap_seed, version < PROTECT_VERSION);
         revert_opmap(&mut body, &inv).map_err(|_| {
             ShellError::IoError("binary tampered: refuse to run modified executable".into())
         })?;
@@ -536,21 +559,42 @@ pub fn open(
     Ok(Some((body, cfi)))
 }
 
-/// Number of real opcodes to permute. Shuffle the contiguous 0x01..=0x2D
-/// range (45 opcodes incl. CaseMatchDyn, ProcSubBegin, ProcSubEnd); Exit at
+/// Number of real opcodes to permute. Shuffle the contiguous 0x01..=0x2F
+/// range (47 opcodes incl. SubshellBgEnd, DynRedirLine); Exit at
 /// 0xFF stays put because the VM treats it as the terminator.
 pub const OPMAP_LO: u8 = 0x01;
-pub const OPMAP_HI: u8 = 0x2E; // exclusive: covers 0x01..=0x2D (45 opcodes)
+pub const OPMAP_HI: u8 = 0x30; // exclusive: covers 0x01..=0x2F (47 opcodes)
 pub const OPMAP_SIZE: usize = (OPMAP_HI - OPMAP_LO) as usize;
 
 /// Derive a deterministic permutation of opcode bytes from a seed.
 /// Returns `perm[orig - OPMAP_LO] = shuffled_byte`.
+///
+/// The Fisher–Yates index comes from the full u64 so the shuffle no longer
+/// depends on the build host's pointer width (pre-v5 `as usize` truncated
+/// on 32-bit hosts — a cross-compile produced a different permutation than
+/// the target runtime expected).
 pub fn opcode_permutation(seed: u32) -> [u8; OPMAP_SIZE] {
     let mut perm: [u8; OPMAP_SIZE] = (OPMAP_LO..OPMAP_HI)
         .collect::<Vec<u8>>()
         .try_into()
         .unwrap();
-    // Fisher–Yates driven by the seed.
+    let mut rng = Rng(seed as u64 | 1);
+    let mut i = perm.len();
+    while i > 1 {
+        i -= 1;
+        let j = (rng.next_u64() % (i as u64 + 1)) as usize;
+        perm.swap(i, j);
+    }
+    perm
+}
+
+/// Pre-v5 shuffle, kept so v4 payloads still revert: reproduces the old
+/// `next_u64() as usize` cast exactly (host word size and all).
+fn opcode_permutation_legacy(seed: u32) -> [u8; OPMAP_SIZE] {
+    let mut perm: [u8; OPMAP_SIZE] = (OPMAP_LO..OPMAP_HI)
+        .collect::<Vec<u8>>()
+        .try_into()
+        .unwrap();
     let mut rng = Rng(seed as u64 | 1);
     let mut i = perm.len();
     while i > 1 {
@@ -561,9 +605,14 @@ pub fn opcode_permutation(seed: u32) -> [u8; OPMAP_SIZE] {
     perm
 }
 
-/// Inverse of `opcode_permutation`: `inv[shuffled - OPMAP_LO] = orig_byte`.
-pub fn opcode_inverse(seed: u32) -> [u8; OPMAP_SIZE] {
-    let perm = opcode_permutation(seed);
+/// Inverse of the seed-derived permutation: `inv[shuffled - OPMAP_LO] =
+/// orig_byte`. `legacy` selects the pre-v5 host-dependent shuffle.
+pub fn opcode_inverse(seed: u32, legacy: bool) -> [u8; OPMAP_SIZE] {
+    let perm = if legacy {
+        opcode_permutation_legacy(seed)
+    } else {
+        opcode_permutation(seed)
+    };
     let mut inv = [0u8; OPMAP_SIZE];
     for (i, &shuffled) in perm.iter().enumerate() {
         inv[(shuffled - OPMAP_LO) as usize] = OPMAP_LO + i as u8;
@@ -612,11 +661,17 @@ mod tests {
     #[test]
     fn permutation_is_bijection() {
         for seed in [0u32, 1, 7, 0xFFFF_FFFF] {
-            let perm = opcode_permutation(seed);
-            let inv = opcode_inverse(seed);
-            for i in 0..OPMAP_SIZE {
-                let shuffled = perm[i];
-                assert_eq!(inv[(shuffled - OPMAP_LO) as usize], OPMAP_LO + i as u8);
+            for legacy in [false, true] {
+                let perm = if legacy {
+                    opcode_permutation_legacy(seed)
+                } else {
+                    opcode_permutation(seed)
+                };
+                let inv = opcode_inverse(seed, legacy);
+                for i in 0..OPMAP_SIZE {
+                    let shuffled = perm[i];
+                    assert_eq!(inv[(shuffled - OPMAP_LO) as usize], OPMAP_LO + i as u8);
+                }
             }
         }
     }
@@ -663,6 +718,30 @@ mod tests {
                 .push(shell_bc::bytecode::Instruction { op, operand });
         }
         shell_bc::serialize::serialize(&bc)
+    }
+
+    /// `open()` on an encrypted build returns the pool-sealed 0x04 stream
+    /// (bytecode 0x03 + spliced pool key + hex entries), not the raw 0x03
+    /// input. Compare semantics: same instructions/redirs/funcs, and every
+    /// pool entry opens back to the original string.
+    fn assert_opens_equivalent(original_bc: &[u8], opened: &[u8]) {
+        if opened == original_bc {
+            return;
+        }
+        let a = shell_bc::deserialize::deserialize(original_bc).unwrap();
+        let b = shell_bc::deserialize::deserialize(opened).unwrap();
+        assert_eq!(
+            format!("{:?}", a.instructions),
+            format!("{:?}", b.instructions)
+        );
+        assert_eq!(format!("{:?}", a.redirs), format!("{:?}", b.redirs));
+        assert_eq!(format!("{:?}", a.funcs), format!("{:?}", b.funcs));
+        let key = b.const_pool.key.expect("opened stream must be pool-sealed");
+        assert_eq!(b.const_pool.len(), a.const_pool.len());
+        for i in 0..a.const_pool.len() as u32 {
+            let got = shell_bc::pool_seal::open_str(&key, i, b.const_pool.get(i).unwrap()).unwrap();
+            assert_eq!(got, a.const_pool.get(i).unwrap(), "pool entry {i}");
+        }
     }
 
     #[test]
@@ -720,7 +799,7 @@ mod tests {
                 assert!(!sealed[HEADER_LEN..].starts_with(b"SHBC"));
             }
             let (opened, _cfi) = open(&sealed, 0).unwrap().unwrap();
-            assert_eq!(opened, bc_bytes);
+            assert_opens_equivalent(&bc_bytes, &opened);
         }
     }
 
@@ -746,7 +825,7 @@ mod tests {
         // Ciphertext == shuffled plaintext (no XOR).
         assert!(sealed[HEADER_LEN..].starts_with(b"SHBC"));
         let (opened, _cfi) = open(&sealed, 0).unwrap().unwrap();
-        assert_eq!(opened, bc_bytes);
+        assert_opens_equivalent(&bc_bytes, &opened);
     }
 
     #[test]
@@ -779,7 +858,7 @@ mod tests {
         // Round-trip through open() with the correct text_crc recovers the
         // original bytecode — proving the unmask derives the true seeds.
         let (opened, _cfi) = open(&sealed, text_crc).unwrap().unwrap();
-        assert_eq!(opened, bc_bytes);
+        assert_opens_equivalent(&bc_bytes, &opened);
     }
 
     #[test]
@@ -797,7 +876,7 @@ mod tests {
         let bc_bytes = sample_shbc();
         let sealed = seal(&bc_bytes, ProtectOptions::all(), 0).unwrap();
         let (opened, cfi) = open(&sealed, 0).unwrap().unwrap();
-        assert_eq!(opened, bc_bytes);
+        assert_opens_equivalent(&bc_bytes, &opened);
         let cfi = cfi.expect("smc seal must produce a CFI table");
         // 4 instructions -> 1 block; entry = CRC32 of the raw rows.
         assert_eq!(cfi.len(), 1);

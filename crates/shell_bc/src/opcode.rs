@@ -39,6 +39,10 @@ pub enum Opcode {
     SubshellBegin,
     /// Restore saved env after subshell (no operand).
     SubshellEnd,
+    /// Close a backgrounded subshell `( ... ) &`: runs the body in a detached
+    /// child VM and hands the handle to `wait`. Operand = first ip of the
+    /// body, so the VM knows which slice to spawn.
+    SubshellBgEnd,
     /// Pop pattern, push glob matches, update glob_surplus (no operand).
     GlobExpand,
     /// Begin a pipeline subshell/brace-group stage. Operand = end_ip (after PipeSubshellEnd).
@@ -50,6 +54,8 @@ pub enum Opcode {
     VarExpand,
     /// Dynamic redirect — pop path from stack. Operand: high byte=kind, low 3 bytes=fd.
     DynRedir,
+    /// Source line of the following DynRedir (bash-style error prefix).
+    DynRedirLine,
     RedirSave,
     RedirRestore,
     /// Push each positional parameter ($1..$N) as separate stack slots.
@@ -108,6 +114,7 @@ impl Opcode {
             Opcode::PipeSubshellEnd => 0x22,
             Opcode::VarExpand => 0x23,
             Opcode::DynRedir => 0x24,
+            Opcode::DynRedirLine => 0x2F,
             Opcode::RedirSave => 0x25,
             Opcode::RedirRestore => 0x26,
             Opcode::StatusFlip => 0x27,
@@ -116,6 +123,7 @@ impl Opcode {
             Opcode::ArraySetIndex => 0x2A,
             Opcode::ProcSubBegin => 0x2C,
             Opcode::ProcSubEnd => 0x2D,
+            Opcode::SubshellBgEnd => 0x2E,
             Opcode::Exit => 0xFF,
         }
     }
@@ -158,6 +166,7 @@ impl Opcode {
             0x22 => Some(Opcode::PipeSubshellEnd),
             0x23 => Some(Opcode::VarExpand),
             0x24 => Some(Opcode::DynRedir),
+            0x2F => Some(Opcode::DynRedirLine),
             0x25 => Some(Opcode::RedirSave),
             0x26 => Some(Opcode::RedirRestore),
             0x27 => Some(Opcode::StatusFlip),
@@ -167,6 +176,7 @@ impl Opcode {
             0x2B => Some(Opcode::CaseMatchDyn),
             0x2C => Some(Opcode::ProcSubBegin),
             0x2D => Some(Opcode::ProcSubEnd),
+            0x2E => Some(Opcode::SubshellBgEnd),
             0xFF => Some(Opcode::Exit),
             _ => None,
         }

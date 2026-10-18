@@ -14,13 +14,21 @@ pub fn deserialize(data: &[u8]) -> Result<Bytecode, ShellError> {
     }
 
     let version = r.read_u8()?;
-    if version != 0x01 && version != 0x02 && version != 0x03 {
+    if version != 0x01 && version != 0x02 && version != 0x03 && version != 0x04 {
         return Err(ShellError::BytecodeError(format!(
             "unsupported bytecode version: {}",
             version
         )));
     }
     r.read_bytes(3)?;
+
+    // 0x04: pool key spliced after the reserved bytes; entries stay hex
+    // ciphertext here and are opened lazily by the VM's pool_str.
+    let key: Option<[u8; 16]> = if version == 0x04 {
+        Some(r.read_bytes(16)?.try_into().unwrap())
+    } else {
+        None
+    };
 
     let pool_count = r.read_u32()? as usize;
     let mut strings = Vec::with_capacity(pool_count);
@@ -32,7 +40,12 @@ pub fn deserialize(data: &[u8]) -> Result<Bytecode, ShellError> {
                 .map_err(|e| ShellError::BytecodeError(format!("utf8: {}", e)))?,
         );
     }
-    let const_pool = ConstPool { strings };
+    let mut const_pool = ConstPool {
+        strings,
+        key,
+        ..Default::default()
+    };
+    const_pool.rebuild_index();
 
     let redir_count = r.read_u32()? as usize;
     let mut redirs = Vec::with_capacity(redir_count);
@@ -59,7 +72,12 @@ pub fn deserialize(data: &[u8]) -> Result<Bytecode, ShellError> {
                 )))
             }
         };
-        redirs.push(RedirEntry { kind, fd, target });
+        redirs.push(RedirEntry {
+            kind,
+            fd,
+            target,
+            line: 0,
+        });
     }
 
     let mut funcs = vec![];
@@ -85,11 +103,53 @@ pub fn deserialize(data: &[u8]) -> Result<Bytecode, ShellError> {
         instructions.push(Instruction::new(op, operand));
     }
 
+    // Optional SLNE trailer: source-line metadata (redir lines, heredoc
+    // warnings, compile-source path). Streams without it keep line 0.
+    let mut src = String::new();
+    let mut heredoc_warns = vec![];
+    if r.remaining() > 0 {
+        if r.remaining() < 4 || &r.read_bytes(4)? != b"SLNE" {
+            return Err(ShellError::BytecodeError(
+                "trailing bytes after instruction table".into(),
+            ));
+        }
+        let n = r.read_u32()? as usize;
+        if n != redirs.len() {
+            return Err(ShellError::BytecodeError(format!(
+                "SLNE redir line count {} != redirs {}",
+                n,
+                redirs.len()
+            )));
+        }
+        for redir in &mut redirs {
+            redir.line = r.read_u32()?;
+        }
+        let warn_count = r.read_u32()? as usize;
+        heredoc_warns = Vec::with_capacity(warn_count);
+        for _ in 0..warn_count {
+            let line = r.read_u32()?;
+            let eof_line = r.read_u32()?;
+            let delim_len = r.read_u32()? as usize;
+            let delim = String::from_utf8(r.read_bytes(delim_len)?.to_vec())
+                .map_err(|e| ShellError::BytecodeError(format!("SLNE delim utf8: {}", e)))?;
+            heredoc_warns.push(shell_ast::HeredocWarning {
+                line,
+                eof_line,
+                delim,
+            });
+        }
+        let src_len = r.read_u32()? as usize;
+        src = String::from_utf8(r.read_bytes(src_len)?.to_vec())
+            .map_err(|e| ShellError::BytecodeError(format!("SLNE src utf8: {}", e)))?;
+    }
+
     Ok(Bytecode {
         instructions,
         const_pool,
         redirs,
         funcs,
+        src,
+        heredoc_warns,
     })
 }
 

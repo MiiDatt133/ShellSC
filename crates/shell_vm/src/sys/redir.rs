@@ -20,11 +20,15 @@ pub struct RedirSpec {
     pub kind: RedirKind,
     pub fd: u32,
     pub target: RedirTargetSpec,
+    /// Source line of the redirect operator (0 for eval-generated chunks).
+    pub line: u32,
 }
 
 #[derive(Debug, Default)]
 pub struct RedirSet {
     pub specs: Vec<RedirSpec>,
+    /// Compile-source path echoed in bash-style diagnostics.
+    pub src: String,
     /// File handles opened by `exec N< f` / `exec N> f` — cloned into the set
     /// so child processes can use them directly (the fds are never dup2'd
     /// into this process, so /proc/self/fd/N would not work).
@@ -34,9 +38,33 @@ pub struct RedirSet {
     pub exec_dups: HashMap<u32, u32>,
 }
 
+/// Strip the Rust io `(os error N)` suffix: bash prints just the strerror.
+pub fn io_short(e: &std::io::Error) -> String {
+    let s = e.to_string();
+    match s.rfind(" (os error ") {
+        Some(i) if s.ends_with(')') => s[..i].to_string(),
+        _ => s,
+    }
+}
+
+/// Bash-style redirect diagnostic prefix: `{src}: line {n}: {detail}`.
+/// Falls back gracefully when the source path or line is unknown (eval).
+pub fn redir_msg(src: &str, line: u32, detail: &str) -> String {
+    match (src.is_empty(), line) {
+        (false, 0) => format!("{}: {}\n", src, detail),
+        (false, n) => format!("{}: line {}: {}\n", src, n, detail),
+        (true, 0) => format!("{}\n", detail),
+        (true, n) => format!("line {}: {}\n", n, detail),
+    }
+}
+
 #[derive(Debug, Clone)]
 enum ResolvedTarget {
-    File { path: String, kind: RedirKind },
+    File {
+        path: String,
+        kind: RedirKind,
+        line: u32,
+    },
     HereDoc(String),
     Stream(u32),
 }
@@ -51,6 +79,7 @@ impl Clone for RedirSet {
         }
         Self {
             specs: self.specs.clone(),
+            src: self.src.clone(),
             exec_files,
             exec_dups: self.exec_dups.clone(),
         }
@@ -73,6 +102,7 @@ impl RedirSet {
     pub fn new(specs: Vec<RedirSpec>) -> Self {
         Self {
             specs,
+            src: String::new(),
             exec_files: HashMap::new(),
             exec_dups: HashMap::new(),
         }
@@ -98,8 +128,13 @@ impl RedirSet {
 
             match &spec.target {
                 RedirTargetSpec::File(path) => {
-                    let data =
-                        std::fs::read(path).map_err(|e| ShellError::IoError(e.to_string()))?;
+                    let data = std::fs::read(path).map_err(|e| {
+                        ShellError::RedirError(redir_msg(
+                            &self.src,
+                            spec.line,
+                            &format!("{}: {}", path, io_short(&e)),
+                        ))
+                    })?;
                     stdin_bytes = Some(data);
                 }
                 RedirTargetSpec::HereDoc(body) => {
@@ -116,8 +151,11 @@ impl RedirSet {
                 RedirTargetSpec::Fd(n) => {
                     // fd not open (e.g. `exec 6< f` failed): bash reports a
                     // bad file descriptor on the redirecting command.
-                    let _ = writeln!(std::io::stderr(), "{}: Bad file descriptor", n);
-                    return Err(ShellError::IoError(format!("{}: Bad file descriptor", n)));
+                    return Err(ShellError::RedirError(redir_msg(
+                        &self.src,
+                        spec.line,
+                        &format!("{}: Bad file descriptor", n),
+                    )));
                 }
             }
         }
@@ -126,6 +164,7 @@ impl RedirSet {
             stdin_bytes,
             RedirSet {
                 specs: other_specs,
+                src: self.src.clone(),
                 exec_files: RedirSet::clone_exec_files(&self.exec_files),
                 exec_dups: self.exec_dups.clone(),
             },
@@ -144,6 +183,7 @@ impl RedirSet {
                 (_, RedirTargetSpec::File(path)) => ResolvedTarget::File {
                     path: path.clone(),
                     kind: spec.kind.clone(),
+                    line: spec.line,
                 },
                 (_, RedirTargetSpec::HereDoc(body)) => ResolvedTarget::HereDoc(body.clone()),
                 (_, RedirTargetSpec::Fd(n)) => {
@@ -164,8 +204,14 @@ impl RedirSet {
 
     pub fn open_input(&self, fd: u32) -> Result<Box<dyn BufRead>, ShellError> {
         match self.resolve_fd(fd) {
-            ResolvedTarget::File { path, .. } => {
-                let file = File::open(path).map_err(|e| ShellError::IoError(e.to_string()))?;
+            ResolvedTarget::File { path, line, .. } => {
+                let file = File::open(&path).map_err(|e| {
+                    ShellError::RedirError(redir_msg(
+                        &self.src,
+                        line,
+                        &format!("{}: {}", path, io_short(&e)),
+                    ))
+                })?;
                 Ok(Box::new(BufReader::new(file)))
             }
             ResolvedTarget::HereDoc(body) => Ok(Box::new(BufReader::new(std::io::Cursor::new(
@@ -181,10 +227,10 @@ impl RedirSet {
 
     pub fn write_output(&self, fd: u32, text: &str) -> Result<(), ShellError> {
         match self.resolve_fd(fd) {
-            ResolvedTarget::File { path, kind } => {
+            ResolvedTarget::File { path, kind, line } => {
                 let mut file = match kind {
-                    RedirKind::Out => open_file(&path, &RedirKind::Out)?,
-                    RedirKind::Append => open_file(&path, &RedirKind::Append)?,
+                    RedirKind::Out => open_file(&path, &RedirKind::Out, &self.src, line)?,
+                    RedirKind::Append => open_file(&path, &RedirKind::Append, &self.src, line)?,
                     RedirKind::In => {
                         return Err(ShellError::NotImplemented(
                             "writing to input redirection".into(),
@@ -199,10 +245,20 @@ impl RedirSet {
                         ))
                     }
                 };
-                file.write_all(text.as_bytes())
-                    .map_err(|e| ShellError::IoError(e.to_string()))?;
-                file.flush()
-                    .map_err(|e| ShellError::IoError(e.to_string()))?;
+                file.write_all(text.as_bytes()).map_err(|e| {
+                    ShellError::RedirError(redir_msg(
+                        &self.src,
+                        line,
+                        &format!("{}: {}", path, io_short(&e)),
+                    ))
+                })?;
+                file.flush().map_err(|e| {
+                    ShellError::RedirError(redir_msg(
+                        &self.src,
+                        line,
+                        &format!("{}: {}", path, io_short(&e)),
+                    ))
+                })?;
                 Ok(())
             }
             ResolvedTarget::Stream(n) => write_default(n, text),
@@ -251,8 +307,8 @@ impl RedirSet {
 
         // stdin (fd 0)
         match map.get(&0) {
-            Some(ResolvedTarget::File { path, .. }) => {
-                let file = open_file(path, &RedirKind::In)?;
+            Some(ResolvedTarget::File { path, line, .. }) => {
+                let file = open_file(path, &RedirKind::In, &self.src, *line)?;
                 cmd.stdin(Stdio::from(file));
             }
             Some(ResolvedTarget::HereDoc(_)) => {
@@ -269,8 +325,8 @@ impl RedirSet {
 
         // stdout (fd 1)
         match map.get(&1) {
-            Some(ResolvedTarget::File { path, kind }) => {
-                let file = open_file(path, kind)?;
+            Some(ResolvedTarget::File { path, kind, line }) => {
+                let file = open_file(path, kind, &self.src, *line)?;
                 cmd.stdout(Stdio::from(file));
             }
             Some(ResolvedTarget::Stream(n)) if *n != 1 => {
@@ -286,10 +342,10 @@ impl RedirSet {
 
         // stderr (fd 2)
         match map.get(&2) {
-            Some(ResolvedTarget::File { path, kind }) => {
+            Some(ResolvedTarget::File { path, kind, line }) => {
                 // Includes the resolved case of `>/dev/null 2>&1`:
                 // resolve_map() already followed 2->1->File("/dev/null")
-                let file = open_file(path, kind)?;
+                let file = open_file(path, kind, &self.src, *line)?;
                 cmd.stderr(Stdio::from(file));
             }
             Some(ResolvedTarget::Stream(n)) if *n != 2 => {
@@ -308,21 +364,24 @@ impl RedirSet {
     }
 }
 
-fn open_file(path: &str, kind: &RedirKind) -> Result<File, ShellError> {
+fn open_file(path: &str, kind: &RedirKind, src: &str, line: u32) -> Result<File, ShellError> {
+    let err = |e: std::io::Error| {
+        ShellError::RedirError(redir_msg(src, line, &format!("{}: {}", path, io_short(&e))))
+    };
     match kind {
         RedirKind::Out => OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(path)
-            .map_err(|e| ShellError::IoError(e.to_string())),
+            .map_err(&err),
         RedirKind::Append => OpenOptions::new()
             .create(true)
             .write(true)
             .append(true)
             .open(path)
-            .map_err(|e| ShellError::IoError(e.to_string())),
-        RedirKind::In => File::open(path).map_err(|e| ShellError::IoError(e.to_string())),
+            .map_err(&err),
+        RedirKind::In => File::open(path).map_err(&err),
         _ => Err(ShellError::NotImplemented("fd redirection".into())),
     }
 }

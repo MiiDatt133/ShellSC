@@ -378,7 +378,7 @@ fn expand_backslash_escapes(s: &str) -> String {
                         i = j - 1;
                     }
                 }
-                Some(&other) => {
+                Some(_) => {
                     out.push('\\');
                     // One UTF-8 char may span several bytes: copy the run raw.
                     let start = i;

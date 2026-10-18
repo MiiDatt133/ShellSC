@@ -98,7 +98,8 @@ fn cmd_build(m: &ArgMatches) -> Result<()> {
     let selfdebug = all || m.get_flag("self-debug");
 
     let src = read_source(&input)?;
-    let (sbc_text, bc_bytes, sc_bytes) = full_pipeline(&src, protect, smc, selfdebug)?;
+    let (sbc_text, bc_bytes, sc_bytes) =
+        full_pipeline(&src, &input.display().to_string(), protect, smc, selfdebug)?;
 
     if emit_sbc {
         let sbc_path = input.with_extension("sbc");

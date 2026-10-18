@@ -5,6 +5,7 @@ pub mod deserialize;
 pub mod obfuscate;
 pub mod opcode;
 pub mod opmap;
+pub mod pool_seal;
 pub mod sbc_emitter;
 pub mod sbc_parser;
 pub mod serialize;

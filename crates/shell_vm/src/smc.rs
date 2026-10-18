@@ -228,6 +228,9 @@ pub enum SmcTarget {
 pub struct SmcRedir {
     pub kind: u8,
     pub fd: u32,
+    /// Source line of the redirect operator (plaintext like kind/fd —
+    /// line numbers are not secret; bash-style error prefixes need it).
+    pub line: u32,
     pub target: SmcTarget,
 }
 
@@ -516,6 +519,7 @@ impl SmcStream {
                 SmcRedir {
                     kind: r.kind,
                     fd: r.fd,
+                    line: r.line,
                     target,
                 }
             })
@@ -580,6 +584,7 @@ mod tests {
         let redirs = vec![SmcRedir {
             kind: 6,
             fd: 0,
+            line: 0,
             target: SmcTarget::HereDoc(b"line1\nline2\n".to_vec()),
         }];
         let funcs = vec![SmcFunc {

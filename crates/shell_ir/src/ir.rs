@@ -23,6 +23,7 @@ impl IrChunk {
         match &mut self.ops[idx] {
             IrOp::JmpIfFail(t) | IrOp::JmpIfOk(t) | IrOp::Jmp(t) => *t = target,
             IrOp::PipeSubshellBegin(t) => *t = target,
+            IrOp::SubshellBgEnd(t) => *t = target,
             other => panic!("patch on non-jump: {:?}", other),
         }
     }
@@ -85,6 +86,8 @@ pub enum IrOp {
     RedirectDyn {
         kind: IrRedirKind,
         fd: u32,
+        /// Source line of the redirect operator (bash-style error prefixes).
+        line: u32,
     },
 
     Jmp(Label),
@@ -112,6 +115,10 @@ pub enum IrOp {
     SubshellBegin,
     /// Restore the saved env from the subshell stack (end of `(...)` subshell).
     SubshellEnd,
+    /// Close a backgrounded `( ... ) &`. Operand = first ip of the body, so
+    /// the VM can spawn the body as a detached child instead of running it
+    /// inline (which would make `&` a no-op for compound commands).
+    SubshellBgEnd(Label),
 
     RedirSave,
     RedirRestore,
@@ -150,6 +157,8 @@ pub struct IrRedir {
     pub kind: IrRedirKind,
     pub fd: u32,
     pub target: IrRedirTarget,
+    /// Source line of the redirect operator (bash-style error prefixes).
+    pub line: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
