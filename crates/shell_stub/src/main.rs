@@ -168,13 +168,17 @@ fn antidebug_check() -> Result<()> {
     bail!("TracerPid not found in /proc/self/status")
 }
 
-fn monotonic_ns() -> u64 {
+/// Thread CPU time, not wall-clock: a descheduled or throttled process
+/// must not accumulate "suspicious" time — only CPU actually burned by
+/// this thread counts (instrumentation burns CPU too, so the gate still
+/// fires under a tracer).
+fn thread_cpu_ns() -> u64 {
     unsafe {
         let mut ts = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
         };
-        if libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) != 0 {
+        if libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) != 0 {
             return 0;
         }
         (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
@@ -187,13 +191,17 @@ fn monotonic_ns() -> u64 {
 /// the threshold leaves a wide margin for thermal throttling while still
 /// catching debugger-driven execution.
 fn timing_anomaly_check() -> Result<()> {
-    let start = monotonic_ns();
+    let start = thread_cpu_ns();
     let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
     for i in 0..2_000_000u64 {
         x = x.wrapping_mul(i | 1) ^ x.rotate_left(17);
     }
     std::hint::black_box(x);
-    let elapsed = monotonic_ns().saturating_sub(start);
+    let end = thread_cpu_ns();
+    if start == 0 || end == 0 {
+        return Ok(());
+    }
+    let elapsed = end.saturating_sub(start);
     if elapsed > 500_000_000 {
         bail!("timing check failed ({elapsed} ns) — traced or emulated");
     }
