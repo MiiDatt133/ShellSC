@@ -267,16 +267,8 @@ fn antihook_check() -> Result<()> {
         for kv in env.split(|b| *b == 0) {
             if let Ok(s) = std::str::from_utf8(kv) {
                 if let Some(v) = s.strip_prefix("LD_PRELOAD=") {
-                    // Termux itself ships libtermux-exec.so (and similar
-                    // prefix libs) via LD_PRELOAD — allow every entry that
-                    // lives under the Termux prefix; refuse the rest.
-                    for entry in v.split(|c: char| c == ':' || c.is_whitespace()) {
-                        if entry.is_empty() {
-                            continue;
-                        }
-                        if !entry.contains("termux") {
-                            fail_silent();
-                        }
+                    if !v.trim().is_empty() {
+                        bail!("LD_PRELOAD is set — unset it to run this program");
                     }
                 }
             }
