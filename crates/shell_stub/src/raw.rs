@@ -32,15 +32,12 @@ mod nr {
 #[cfg(target_arch = "arm")]
 mod nr {
     pub const READ: i64 = 3;
-    pub const READV: i64 = 145;
     pub const OPENAT: i64 = 322;
     pub const CLOSE: i64 = 6;
-    pub const EXIT: i64 = 1;
     pub const EXIT_GROUP: i64 = 248;
     pub const GETPPID: i64 = 64;
     pub const WRITE: i64 = 4;
     pub const PIPE: i64 = 42;
-    pub const FORK: i64 = 2;
     pub const CLONE: i64 = 120;
     pub const WAIT4: i64 = 114;
     pub const PTRACE: i64 = 26;

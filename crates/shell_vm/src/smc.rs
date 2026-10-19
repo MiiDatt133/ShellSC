@@ -480,10 +480,6 @@ impl SmcStream {
         &self.funcs
     }
 
-    fn key(&self) -> [u8; 16] {
-        self.key
-    }
-
     /// Decrypt everything back into plaintext bytecode pieces. Used by
     /// `eval` splicing, which unseals, splices, and re-seals. Requires
     /// the same salt used at seal time; replays the chain sequentially.
