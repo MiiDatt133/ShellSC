@@ -55,6 +55,7 @@ fn cmd_pack(m: &ArgMatches) -> Result<()> {
     let protect = all || m.get_flag("protect");
     let smc = all || m.get_flag("smc");
     let selfdebug = all || m.get_flag("self-debug");
+    let fast = m.get_flag("fast");
 
     let bc = sbc_to_bytecode(&sbc_text)?;
     let bc_bytes = bc.to_bytes();
@@ -62,12 +63,16 @@ fn cmd_pack(m: &ArgMatches) -> Result<()> {
         let mut opts = shell_pack::ProtectOptions::all();
         opts.smc = smc;
         opts.selfdebug = selfdebug;
-        let seed = shell_pack::variant_seed();
-        let ws_root = shell_pack::workspace_root().map_err(map_shell_err)?;
-        eprintln!("protect: building stub variant {seed} (first build is slow)…");
-        let stub = shell_pack::build_variant_stub(&ws_root, seed).map_err(map_shell_err)?;
+        let stub = if fast {
+            None
+        } else {
+            let seed = shell_pack::variant_seed();
+            let ws_root = shell_pack::workspace_root().map_err(map_shell_err)?;
+            eprintln!("protect: building stub variant {seed} (first build is slow)…");
+            Some(shell_pack::build_variant_stub(&ws_root, seed).map_err(map_shell_err)?)
+        };
         shell_pack::Packer::new()
-            .pack_protected(&bc_bytes, opts, Some(&stub))
+            .pack_protected(&bc_bytes, opts, stub.as_deref())
             .map_err(map_shell_err)?
     } else {
         shell_pack::Packer::new()
@@ -96,10 +101,17 @@ fn cmd_build(m: &ArgMatches) -> Result<()> {
     let protect = all || m.get_flag("protect");
     let smc = all || m.get_flag("smc");
     let selfdebug = all || m.get_flag("self-debug");
+    let fast = m.get_flag("fast");
 
     let src = read_source(&input)?;
-    let (sbc_text, bc_bytes, sc_bytes) =
-        full_pipeline(&src, &input.display().to_string(), protect, smc, selfdebug)?;
+    let (sbc_text, bc_bytes, sc_bytes) = full_pipeline(
+        &src,
+        &input.display().to_string(),
+        protect,
+        smc,
+        selfdebug,
+        fast,
+    )?;
 
     if emit_sbc {
         let sbc_path = input.with_extension("sbc");

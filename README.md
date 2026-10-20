@@ -65,7 +65,7 @@ Not supported: write-mode process substitution `>(cmd)`, associative arrays (`de
 
 ## Protection (`--protect`)
 
-Available on `build` and `pack`. Use `--all` to enable every protection at once (`--protect --smc --self-debug`). A protected `.sc` prints `Protected by ShellSC` as its first line when run. Running with `LD_PRELOAD` set is refused with a clear error; other anti-tamper detections exit(1) with no diagnostic output, so failures are indistinguishable from ordinary script errors.
+Available on `build` and `pack`. Use `--all` to enable every protection at once (`--protect --smc --self-debug`). Add `--fast` to skip the per-build stub variant recompilation (pack time drops from minutes to ~0.2s; every crypto/runtime protection stays, only the machine-code variation between builds is lost). A protected `.sc` prints `Protected by ShellSC` as its first line when run. Running with `LD_PRELOAD` set is refused with a clear error; other anti-tamper detections exit(1) with no diagnostic output, so failures are indistinguishable from ordinary script errors.
 
 - XOR encryption of bytecode with per-build random key
 - Per-build opcode shuffling (Fisher-Yates)

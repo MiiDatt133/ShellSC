@@ -29,6 +29,7 @@ pub fn full_pipeline(
     protect: bool,
     smc: bool,
     selfdebug: bool,
+    fast: bool,
 ) -> Result<(String, Vec<u8>, Vec<u8>)> {
     // Lex directly (not sh_to_sbc) so unterminated-heredoc warnings survive
     // to the bytecode; src_path is echoed in bash-style diagnostics.
@@ -67,23 +68,28 @@ pub fn full_pipeline(
         opts.selfdebug = selfdebug;
         // Per-build stub variant: rebuild the stub with fresh guard
         // constants so its machine code differs on every protected build.
+        // `fast` skips the recompile and uses the bundled stub — all
+        // crypto/protections stay, only machine-code variation is lost.
         // A prebuilt shellsc has no workspace on the user's machine —
-        // fall back to the bundled stub (still fully sealed, minus the
-        // per-build variant entropy).
-        let variant_stub = match shell_pack::workspace_root() {
-            Ok(ws_root) => {
-                let seed = match std::env::var("SHELLSC_VARIANT_SEED") {
-                    Ok(s) => s
-                        .parse()
-                        .map_err(|_| anyhow::anyhow!("bad SHELLSC_VARIANT_SEED"))?,
-                    Err(_) => shell_pack::variant_seed(),
-                };
-                eprintln!("protect: building stub variant {seed} (first build is slow)…");
-                Some(shell_pack::build_variant_stub(&ws_root, seed).map_err(map_shell_err)?)
-            }
-            Err(_) => {
-                eprintln!("protect: no workspace found, using bundled stub");
-                None
+        // same fallback.
+        let variant_stub = if fast {
+            None
+        } else {
+            match shell_pack::workspace_root() {
+                Ok(ws_root) => {
+                    let seed = match std::env::var("SHELLSC_VARIANT_SEED") {
+                        Ok(s) => s
+                            .parse()
+                            .map_err(|_| anyhow::anyhow!("bad SHELLSC_VARIANT_SEED"))?,
+                        Err(_) => shell_pack::variant_seed(),
+                    };
+                    eprintln!("protect: building stub variant {seed} (first build is slow)…");
+                    Some(shell_pack::build_variant_stub(&ws_root, seed).map_err(map_shell_err)?)
+                }
+                Err(_) => {
+                    eprintln!("protect: no workspace found, using bundled stub");
+                    None
+                }
             }
         };
         Packer::new()

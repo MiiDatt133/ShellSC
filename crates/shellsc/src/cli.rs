@@ -64,6 +64,12 @@ pub fn build_cli() -> Command {
                         .long("all")
                         .action(ArgAction::SetTrue)
                         .help("Enable all protections: --protect --smc --self-debug"),
+                )
+                .arg(
+                    Arg::new("fast")
+                        .long("fast")
+                        .action(ArgAction::SetTrue)
+                        .help("Skip per-build stub variant recompilation (faster builds, same protection minus machine-code variation)"),
                 ),
         )
         .subcommand(
@@ -125,6 +131,12 @@ pub fn build_cli() -> Command {
                         .long("all")
                         .action(ArgAction::SetTrue)
                         .help("Enable all protections: --protect --smc --self-debug"),
+                )
+                .arg(
+                    Arg::new("fast")
+                        .long("fast")
+                        .action(ArgAction::SetTrue)
+                        .help("Skip per-build stub variant recompilation (faster builds, same protection minus machine-code variation)"),
                 ),
         )
         .subcommand(
