@@ -57,6 +57,8 @@ pub fn full_pipeline(
                 subst: pass != "bcf",
                 condneg: pass == "",
                 arith_neutral: pass == "",
+                mba: pass == "",
+                region_cff: pass == "",
                 seed: obf_seed,
             },
         );

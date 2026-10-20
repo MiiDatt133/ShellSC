@@ -85,6 +85,8 @@ fn obfuscated_runs_match_original_semantics() {
                     subst: true,
                     condneg: true,
                     arith_neutral: true,
+                    mba: true,
+                    region_cff: true,
                     seed,
                 },
             );
@@ -112,6 +114,8 @@ fn obfuscation_changes_the_stream() {
             subst: true,
             condneg: true,
             arith_neutral: true,
+            mba: true,
+            region_cff: true,
             seed: 1234,
         },
     );
@@ -134,6 +138,8 @@ fn seeds_produce_different_layouts() {
                 subst: true,
                 condneg: true,
                 arith_neutral: true,
+                mba: true,
+                region_cff: true,
                 seed,
             },
         );
