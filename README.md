@@ -73,8 +73,8 @@ Available on `build` and `pack`. Use `--all` to enable every protection at once 
 - Bytecode obfuscation passes, applied before sealing:
   - Bogus control flow — a subset of jumps routes through appended decoy junk blocks
   - Instruction substitution — long pool strings split into `PushConst(a) PushConst(b) ConcatN(2)`
-  - MBA substitution — arithmetic expressions rewritten into mixed boolean-arithmetic identities like `(E)|((E)^(E))` (equivalent, four copies of `E`)
-  - Region control-flow flattening — straight-line status-setting runs split into blocks behind a hidden state-variable dispatcher
+  - MBA substitution — arithmetic expressions rewritten into mixed boolean-arithmetic identities like `(E)|((E)^(E))` (3 copies of `E`, ConcatN(7))
+  - Region control-flow flattening — eligible straight-line runs with a status setter are split into blocks dispatched by a hidden `$state` variable; the last setter is guaranteed to sit in the final block so exit status passes through unchanged
 - Control-flow flattening + opaque predicates
 - Virtualized dispatch obfuscation
 - Seeded-header masking (v4) — seeds stored XOR-masked with the stub `.text` CRC
